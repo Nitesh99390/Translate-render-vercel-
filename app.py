@@ -19,6 +19,7 @@ Optional env
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import aiohttp
@@ -33,10 +34,19 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
-app = FastAPI(title="EPUB Translator Worker", version="2.0", docs_url=None, redoc_url=None)
 _started = time.time()
 _stats = {"requests": 0, "strings": 0, "errors": 0}
 _session: Optional[aiohttp.ClientSession] = None
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    yield
+    if _session and not _session.closed:
+        await _session.close()
+
+
+app = FastAPI(title="EPUB Translator Worker", version="2.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 
 class TranslateIn(BaseModel):
@@ -55,12 +65,6 @@ async def session() -> aiohttp.ClientSession:
     return _session
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _session and not _session.closed:
-        await _session.close()
-
-
 @app.get("/")
 async def health() -> dict:
     return {"status": "ok", "uptime": int(time.time() - _started), **_stats}
@@ -76,10 +80,12 @@ async def _google(texts: List[str], lang: str, source: str) -> List[str]:
             async with s.post(GOOGLE_URL, params=params, data=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    if isinstance(data, list) and len(data) == len(texts):
-                        return [x[0] if isinstance(x, list) else str(x) for x in data]
+                    # single item: Google returns ["text"] (a plain string, not a list)
                     if len(texts) == 1 and isinstance(data, list) and data:
-                        return [data[0] if isinstance(data[0], str) else data[0][0]]
+                        first = data[0]
+                        return [first if isinstance(first, str) else str(first[0])]
+                    if isinstance(data, list) and len(data) == len(texts):
+                        return [str(x[0]) if isinstance(x, list) else str(x) for x in data]
                     last_err = "unexpected response shape"
                 elif resp.status == 429:
                     last_err = "rate limited"
