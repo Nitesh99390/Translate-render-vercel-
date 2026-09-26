@@ -1,0 +1,8 @@
+# Master bot (Oracle VM) — bot.py
+pyrogram==2.0.106
+tgcrypto
+aiohttp
+beautifulsoup4
+lxml
+razorpay
+python-dotenv
