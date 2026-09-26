@@ -1,0 +1,17 @@
+# Oracle VM: sudo cp epub-bot.service /etc/systemd/system/ && sudo systemctl enable --now epub-bot
+[Unit]
+Description=EPUB Translator Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Translate-render-vercel-
+EnvironmentFile=/home/ubuntu/Translate-render-vercel-/.env
+ExecStart=/home/ubuntu/Translate-render-vercel-/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

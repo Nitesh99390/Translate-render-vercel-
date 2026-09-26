@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: epub-translate-worker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: WORKER_SECRET
+        sync: false
