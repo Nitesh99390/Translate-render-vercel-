@@ -10,8 +10,10 @@ Endpoints
 
 Optional env
   WORKER_SECRET   if set, master must send header  X-Worker-Key: <secret>
-  MAX_ITEMS       max strings per request (default 100)
-  MAX_CHARS       max total characters per request (default 12000)
+  MAX_ITEMS       max strings per request (default 400)
+  MAX_CHARS       max total characters per request (default 30000)
+  (the master sends ~150 items / ~9000 chars per batch by default; keep
+   these limits above the master's BATCH_MAX_ITEMS / BATCH_MAX_CHARS)
 """
 
 import asyncio
@@ -23,8 +25,8 @@ import aiohttp
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "100"))
-MAX_CHARS = int(os.environ.get("MAX_CHARS", "12000"))
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "400"))
+MAX_CHARS = int(os.environ.get("MAX_CHARS", "30000"))
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/t"
 HEADERS = {
@@ -46,7 +48,10 @@ class TranslateIn(BaseModel):
 async def session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=40))
+        connector = aiohttp.TCPConnector(limit=64, limit_per_host=0, ttl_dns_cache=300, keepalive_timeout=60)
+        _session = aiohttp.ClientSession(
+            headers=HEADERS, connector=connector, timeout=aiohttp.ClientTimeout(total=40)
+        )
     return _session
 
 
