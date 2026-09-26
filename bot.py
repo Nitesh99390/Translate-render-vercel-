@@ -133,7 +133,9 @@ class Config:
     FORCE_SUB_CHANNEL = _env("FORCE_SUB_CHANNEL")               # "@channel" or id
     SUPPORT_CONTACT = _env("SUPPORT_CONTACT", "@admin")
 
-    DATA_DIR = Path(_env("DATA_DIR", "data"))
+    # absolute so Pyrogram's download_media (which resolves relative paths
+    # against *its own* parent dir) and our temp files always agree
+    DATA_DIR = Path(_env("DATA_DIR", "data")).expanduser().resolve()
     DB_PATH = DATA_DIR / "bot.db"
     LOG_PATH = DATA_DIR / "bot.log"
     SESSION_NAME = _env("SESSION_NAME", "translator_bot")
@@ -456,13 +458,23 @@ class WorkerPool:
 
     @staticmethod
     def normalize(url: str) -> str:
-        url = url.strip()
-        if not url.startswith("http"):
+        url = url.strip().strip("<>").rstrip("/")
+        if not re.match(r"^https?://", url, re.I):
             url = "https://" + url
-        return url.rstrip("/")
+        return url
+
+    @staticmethod
+    def is_valid(url: str) -> bool:
+        # scheme + a real host name (with a dot or a port) — rejects things like
+        # "https:///addworker" that came from a stray command while waiting for input
+        return bool(re.match(r"^https?://(?:[\w-]+\.)+[\w-]+(?::\d+)?(?:/[^\s]*)?$", url, re.I)) or bool(
+            re.match(r"^https?://(?:localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?(?:/[^\s]*)?$", url, re.I)
+        )
 
     def add(self, url: str) -> bool:
         url = self.normalize(url)
+        if not self.is_valid(url):
+            return False
         ok = db.add_worker(url)
         self.reload()
         return ok
@@ -492,27 +504,34 @@ class WorkerPool:
     def total_capacity(self) -> int:
         return sum(w.max_inflight for w in self.available())
 
+    async def _ping(self, session: aiohttp.ClientSession, w: Worker) -> None:
+        t0 = time.monotonic()
+        try:
+            # Render free instances need up to ~60 s to wake from sleep
+            async with session.get(f"{w.url}/", timeout=aiohttp.ClientTimeout(total=75)) as r:
+                ok = r.status == 200
+        except Exception:
+            ok = False
+        lat = time.monotonic() - t0
+        if ok:
+            w.healthy = True
+            w.fails = 0
+            w.last_seen = time.time()
+            w.latency = lat if w.latency == 0 else w.latency * 0.7 + lat * 0.3
+        else:
+            # a failed ping means "down right now"; retry on the next request
+            # after a short cool-down instead of waiting for N failed jobs
+            w.fails += 1
+            w.healthy = False
+            w.disabled_until = time.time() + 60
+
     async def health_check(self, session: aiohttp.ClientSession) -> None:
-        for w in list(self.workers.values()):
-            if not w.enabled:
-                continue
-            t0 = time.monotonic()
-            try:
-                async with session.get(f"{w.url}/", timeout=aiohttp.ClientTimeout(total=20)) as r:
-                    ok = r.status == 200
-            except Exception:
-                ok = False
-            lat = time.monotonic() - t0
-            if ok:
-                w.healthy = True
-                w.fails = 0
-                w.last_seen = time.time()
-                w.latency = lat if w.latency == 0 else w.latency * 0.7 + lat * 0.3
-            else:
-                w.report(False)
+        targets = [w for w in list(self.workers.values()) if w.enabled]
+        if targets:
+            await asyncio.gather(*(self._ping(session, w) for w in targets))
 
     def summary(self) -> str:
-        if not self.workers:
+        if not self.workers and Config.DIRECT_CONCURRENCY <= 0:
             return "No workers configured."
         lines = []
         for i, w in enumerate(self.workers.values(), 1):
@@ -665,6 +684,14 @@ class Translator:
         finally:
             self._release(w)
 
+    @staticmethod
+    def _clean(out: List[str]) -> List[str]:
+        # Google's gtx endpoint returns HTML-escaped text ("It&#39;s", "&quot;",
+        # "&amp;").  If we insert that as-is, BeautifulSoup escapes the '&'
+        # again and the reader shows a literal "&#39;".  Unescape once here so
+        # the text node holds real characters and is serialised correctly.
+        return [html.unescape(x) for x in out]
+
     async def translate_batch(self, texts: List[str]) -> List[str]:
         if not texts:
             return []
@@ -677,7 +704,7 @@ class Translator:
                 tried.add(w.url)
                 out = await self._send(w, texts)
                 if out is not None:
-                    return out
+                    return self._clean(out)
                 await asyncio.sleep(0.3 * (attempt + 1))
             # last resort: hit Google directly even if DIRECT_CONCURRENCY == 0
             if Config.DIRECT_FALLBACK:
@@ -688,7 +715,7 @@ class Translator:
                     finally:
                         self._release(direct_worker)
                     if out is not None:
-                        return out
+                        return self._clean(out)
                     await asyncio.sleep(1.5 * (attempt + 1))
         raise TranslationError("All workers failed")
 
@@ -767,6 +794,13 @@ class Translator:
 SKIP_TAGS = {"script", "style", "code", "pre", "svg", "math", "head", "title", "meta", "link"}
 DOC_EXT = (".xhtml", ".html", ".htm", ".xml")
 _ws_re = re.compile(r"^(\s*)(.*?)(\s*)$", re.S)
+# Original `<?xml ...?>` prolog of a chapter (bytes, before parsing).
+_XML_PROLOG_RE = re.compile(rb"^\s*<\?xml[^>]*\?>")
+# What the prolog looks like after a round-trip through the parsers:
+#   lxml         -> "<!--?xml version=... ?-->"  (turned into a comment — invalid XHTML!)
+#   html.parser  -> "<?xml version=... ?>"        (kept as a processing instruction)
+_OUT_PROLOG_RE = re.compile(r"^\s*(?:<!--\?xml[^>]*\?-->|<\?xml[^>]*\?>)\s*")
+XML_PROLOG = '<?xml version="1.0" encoding="utf-8"?>\n'
 
 # Non-text string nodes that must never be translated or counted.
 #   PreformattedString = Comment, CData, ProcessingInstruction (<?xml ...?>),
@@ -805,7 +839,27 @@ class EpubTranslator:
     @staticmethod
     def _is_doc(name: str) -> bool:
         low = name.lower()
+        if low.endswith("/"):  # zip directory entry
+            return False
         return low.endswith(DOC_EXT) and not low.endswith(("container.xml", ".opf", ".ncx")) and "meta-inf/" not in low
+
+    @staticmethod
+    def _looks_like_xhtml(name: str, raw: bytes) -> bool:
+        """Generic *.xml files (page-map.xml, encryption.xml, nav.xml …) are only
+        chapters if they actually contain an <html> root; otherwise running them
+        through the HTML parser would corrupt them."""
+        if not name.lower().endswith(".xml"):
+            return True
+        head = raw[:4096].lower()
+        return b"<html" in head or b"1999/xhtml" in head
+
+    @staticmethod
+    def _serialize(soup: BeautifulSoup, raw: bytes) -> bytes:
+        out = str(soup)
+        if _XML_PROLOG_RE.match(raw):
+            # drop whatever the parser made of the prolog and emit a clean one
+            out = XML_PROLOG + _OUT_PROLOG_RE.sub("", out, count=1)
+        return out.encode("utf-8")
 
     @staticmethod
     def _collect(soup: BeautifulSoup) -> List[NavigableString]:
@@ -836,20 +890,24 @@ class EpubTranslator:
             docs = [n for n in names if self._is_doc(n)]
             if not docs:
                 raise TranslationError("No readable chapters found in EPUB")
-            parsed: List[Tuple[str, BeautifulSoup, List[NavigableString]]] = []
+            parsed: List[Tuple[str, BeautifulSoup, List[NavigableString], bytes]] = []
             all_texts: List[str] = []
             for n in docs:
                 raw = zin.read(n)
+                if not self._looks_like_xhtml(n, raw):
+                    continue
                 soup = BeautifulSoup(raw, HTML_PARSER)
                 nodes = self._collect(soup)
-                parsed.append((n, soup, nodes))
+                if not nodes:
+                    continue  # nothing to translate → copy the file through untouched
+                parsed.append((n, soup, nodes, raw))
                 for node in nodes:
                     m = _ws_re.match(str(node))
                     all_texts.append(m.group(2) if m else str(node))
 
             ncx_docs: List[Tuple[str, BeautifulSoup, list]] = []
             for n in names:
-                if n.lower().endswith(".ncx"):
+                if n.lower().endswith(".ncx") and not n.endswith("/"):
                     try:
                         ncx = BeautifulSoup(zin.read(n), "xml")
                         labels = [t for t in ncx.find_all("text") if t.string and t.string.strip()]
@@ -863,13 +921,13 @@ class EpubTranslator:
     def _apply_and_write(src: Path, dst: Path, names, parsed, translated, ncx_docs, ncx_out) -> None:
         i = 0
         new_content: Dict[str, bytes] = {}
-        for n, soup, nodes in parsed:
+        for n, soup, nodes, raw in parsed:
             for node in nodes:
                 m = _ws_re.match(str(node))
                 lead, _, trail = (m.group(1), m.group(2), m.group(3)) if m else ("", "", "")
                 node.replace_with(NavigableString(f"{lead}{translated[i]}{trail}"))
                 i += 1
-            new_content[n] = str(soup).encode("utf-8")
+            new_content[n] = EpubTranslator._serialize(soup, raw)
 
         j = 0
         for n, ncx, labels in ncx_docs:
@@ -879,14 +937,24 @@ class EpubTranslator:
             new_content[n] = str(ncx).encode("utf-8")
 
         # rebuild zip – mimetype MUST be first and stored
+        seen: set = set()
         with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
             if "mimetype" in names:
                 zout.writestr("mimetype", zin.read("mimetype"), compress_type=zipfile.ZIP_STORED)
+                seen.add("mimetype")
             for info in zin.infolist():
-                if info.filename == "mimetype":
+                if info.filename in seen or info.filename.endswith("/"):
+                    continue  # duplicates / directory entries
+                seen.add(info.filename)
+                data = new_content.get(info.filename)
+                if data is None:
+                    # untouched file: copy bytes 1:1 keeping the original metadata
+                    zout.writestr(info, zin.read(info.filename))
                     continue
-                data = new_content.get(info.filename, zin.read(info.filename))
-                zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+                zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.external_attr = info.external_attr
+                zout.writestr(zi, data)
 
     # ── public ───────────────────────────────────────────────────────────────────────
 
@@ -937,6 +1005,10 @@ class JobQueue:
     def user_has_job(self, uid: int) -> bool:
         return uid in self.by_user
 
+    def queued_count(self) -> int:
+        # queue.qsize() also counts cancelled entries that were not popped yet
+        return max(0, len(self.jobs) - len(self.running))
+
     def position(self, job_id: int) -> int:
         queued = sorted((j for j in self.jobs.values() if j.id not in self.running), key=lambda j: (j.priority, j.created))
         for i, j in enumerate(queued, 1):
@@ -956,6 +1028,12 @@ class JobQueue:
         job.cancelled = True
         if job.task and not job.task.done():
             job.task.cancel()
+        elif job_id not in self.running:
+            # Still waiting in the queue: release the user's slot *now* instead of
+            # when the worker loop eventually pops it (otherwise the user is told
+            # "you already have a file in progress" after cancelling).
+            db.finish_job(job_id, "cancelled")
+            self._cleanup(job)
         return True
 
     def clear_stuck(self) -> int:
@@ -981,7 +1059,12 @@ class JobQueue:
         log.info("Job worker #%d started", n)
         while True:
             job: Job = await self.queue.get()
-            if job.cancelled:
+            if job.cancelled or job.id not in self.jobs:
+                self._cleanup(job)
+                self.queue.task_done()
+                continue
+            if db.is_banned(job.user_id):
+                db.finish_job(job.id, "cancelled")
                 self._cleanup(job)
                 self.queue.task_done()
                 continue
@@ -991,6 +1074,9 @@ class JobQueue:
                 await job.task
             except asyncio.CancelledError:
                 if not job.cancelled:
+                    db.finish_job(job.id, "failed")
+                    self._cleanup(job)
+                    self.queue.task_done()
                     raise  # the worker loop itself is being shut down
                 db.finish_job(job.id, "cancelled")
                 await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
@@ -1043,12 +1129,15 @@ class JobQueue:
             f"🌐 {lang_name(job.lang)} · {epub.segments:,} segments · {epub.chars:,} chars\n"
             f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s · {int(epub.chars / max(elapsed, 1) / 1000)}k chars/s"
         )
-        await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
+        try:
+            await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
         try:
             await job.status_msg.delete()
         except Exception:
             pass
-        out_path.unlink(missing_ok=True)
         db.finish_job(job.id, "done", epub.segments, epub.chars, elapsed)
         db.record_usage(job.user_id)
         log.info("job %d done: user=%d file=%s %.1fs", job.id, job.user_id, job.file_name, elapsed)
@@ -1157,15 +1246,20 @@ def fmt_dt(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%d %b %Y") if ts else "—"
 
 
-async def safe_edit(msg: Message, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
-    try:
-        await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-    except MessageNotModified:
-        pass
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-    except Exception as e:  # noqa: BLE001
-        log.debug("edit failed: %s", e)
+async def safe_edit(msg: Optional[Message], text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    if msg is None:
+        return
+    for _ in range(2):
+        try:
+            await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            return
+        except MessageNotModified:
+            return
+        except FloodWait as e:
+            await asyncio.sleep(min(e.value, 30))
+        except Exception as e:  # noqa: BLE001
+            log.debug("edit failed: %s", e)
+            return
 
 
 def user_line(row: sqlite3.Row) -> str:
@@ -1181,10 +1275,20 @@ def user_line(row: sqlite3.Row) -> str:
 
 # per-admin pending input (e.g. waiting for worker URL / broadcast text)
 pending_input: Dict[int, str] = {}
+# users whose file is currently being downloaded (slot reserved, job not yet queued)
+downloading: set = set()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  BOT
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Pyrogram 2.0.x grabs the running loop in Client.__init__ via the deprecated
+# asyncio.get_event_loop(); on Python >= 3.12 that warns and on 3.14 it raises
+# when no loop exists yet, so create one explicitly first.
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 app = Client(
     Config.SESSION_NAME,
@@ -1196,11 +1300,16 @@ app = Client(
 )
 
 
+def _chat_ref(ref: str):
+    """'-1001234567890' → int, '@channel' → str (Pyrogram needs ints for numeric ids)."""
+    return int(ref) if re.fullmatch(r"-?\d+", ref) else ref
+
+
 async def check_force_sub(client: Client, uid: int) -> bool:
     if not Config.FORCE_SUB_CHANNEL or Config.is_admin(uid):
         return True
     try:
-        m = await client.get_chat_member(Config.FORCE_SUB_CHANNEL, uid)
+        m = await client.get_chat_member(_chat_ref(Config.FORCE_SUB_CHANNEL), uid)
         return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
     except UserNotParticipant:
         return False
@@ -1302,7 +1411,7 @@ async def cmd_status(client: Client, message: Message) -> None:
         f"💼 Plan: {user_line(row)}\n"
         f"📚 Files translated: {row['total_files']}\n\n"
         f"🖥 Workers online: {len(pool.available())}/{len(pool.workers)}\n"
-        f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queue.qsize()}" + mine
+        f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queued_count()}" + mine
     )
 
 
@@ -1345,10 +1454,16 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
         return await cq.answer("Payment not found.", show_alert=True)
     if p["status"] == "paid":
         return await cq.answer("Already activated ✅", show_alert=True)
-    await cq.answer("Checking payment…")
+    if not payments.enabled:
+        return await cq.answer("Payment service is not configured.", show_alert=True)
+    # a callback query can only be answered ONCE — so verify first, answer after
     if await payments.verify(link_id):
+        # re-check: two quick taps must not grant premium twice
+        if (db.get_payment(link_id) or {})["status"] == "paid":
+            return await cq.answer("Already activated ✅", show_alert=True)
         db.mark_paid(link_id)
         until = db.add_premium(p["user_id"], p["days"])
+        await cq.answer("Payment verified ✅")
         await safe_edit(cq.message, f"🎉 <b>Premium activated!</b>\nValid till <b>{fmt_dt(until)}</b>. Enjoy unlimited translations.")
         if Config.OWNER_ID:
             try:
@@ -1362,6 +1477,8 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
 # ── cancel ─────────────────────────────────────────────────────────────────
 @app.on_message(filters.private & filters.command("cancel"))
 async def cmd_cancel(client: Client, message: Message) -> None:
+    if not message.from_user:
+        return
     uid = message.from_user.id
     jid = jobs.by_user.get(uid)
     if jid and jobs.cancel(jid):
@@ -1409,16 +1526,28 @@ async def on_document(client: Client, message: Message) -> None:
         return await message.reply_text(
             f"⏳ Daily free limit reached ({Config.FREE_DAILY_LIMIT} files).\n⭐ Upgrade with /premium for unlimited access."
         )
-    if jobs.user_has_job(uid):
+    if jobs.user_has_job(uid) or uid in downloading:
         return await message.reply_text("⚠️ You already have a file in progress. Use /cancel to stop it first.")
-    if not pool.available() and not Config.DIRECT_FALLBACK:
+    if not pool.available() and not Config.DIRECT_FALLBACK and Config.DIRECT_CONCURRENCY <= 0:
         return await message.reply_text("⚠️ Translation service is offline right now. Please try again later.")
 
+    # reserve the user's slot *before* the (slow) download so two files sent
+    # back-to-back cannot both slip past the "one job per user" check
+    downloading.add(uid)
     status = await message.reply_text("📥 <b>Downloading…</b>")
     tmp_dir = Path(tempfile.mkdtemp(prefix="epub_", dir=Config.DATA_DIR))
-    path = await message.download(file_name=str(tmp_dir / re.sub(r"[^\w.\- ]", "_", name)))
+    safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or "book.epub"
+    if not safe_name.lower().endswith(".epub"):
+        safe_name += ".epub"
+    try:
+        path = await message.download(file_name=str(tmp_dir / safe_name))
+    except Exception as e:  # noqa: BLE001
+        log.warning("download failed for %s: %s", uid, e)
+        path = None
     if not path or not zipfile.is_zipfile(path):
-        await safe_edit(status, "❌ This file is not a valid EPUB.")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        downloading.discard(uid)
+        await safe_edit(status, "❌ Download failed or this file is not a valid EPUB.")
         return
 
     job_id = db.add_job(uid, name, row["lang"])
@@ -1434,6 +1563,7 @@ async def on_document(client: Client, message: Message) -> None:
         status_msg=status,
     )
     await jobs.submit(job)
+    downloading.discard(uid)
     pos = jobs.position(job_id)
     await safe_edit(
         status,
@@ -1456,7 +1586,7 @@ def admin_text() -> str:
         "🛠 <b>Admin panel</b>\n\n"
         f"👥 Users: {s['users']} (⭐ {s['premium']} · 🚫 {s['banned']})\n"
         f"🖥 Workers: {len(pool.available())}/{len(pool.workers)} online\n"
-        f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queue.qsize()}\n\n"
+        f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queued_count()}\n\n"
         "<b>Commands</b>\n"
         "<code>/addworker URL</code> · <code>/delworker URL</code>\n"
         "<code>/addpremium USER_ID [days]</code> · <code>/revoke USER_ID</code>\n"
@@ -1502,9 +1632,12 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
         )
     elif action == "queue":
         lines = []
-        for j in sorted(jobs.jobs.values(), key=lambda j: (j.id not in jobs.running, j.priority, j.created)):
+        ordered = sorted(jobs.jobs.values(), key=lambda j: (j.id not in jobs.running, j.priority, j.created))
+        for j in ordered[:40]:
             state = "⚙️" if j.id in jobs.running else "⏳"
             lines.append(f"{state} #{j.id} · <code>{j.user_id}</code> · {html.escape(j.file_name[:30])} → {j.lang}")
+        if len(ordered) > 40:
+            lines.append(f"… and {len(ordered) - 40} more")
         await safe_edit(cq.message, "📋 <b>Queue</b>\n\n" + ("\n".join(lines) or "Empty."), back)
     elif action == "clear":
         n = jobs.clear_stuck()
@@ -1542,9 +1675,12 @@ async def cb_workers(client: Client, cq: CallbackQuery) -> None:
 
 @app.on_message(admin_filter & filters.command("addworker"))
 async def cmd_addworker(client: Client, message: Message) -> None:
+    pending_input.pop(message.from_user.id, None)
     if len(message.command) < 2:
         return await message.reply_text("Usage: <code>/addworker https://xyz.onrender.com</code>")
     added = [u for u in message.command[1:] if pool.add(u)]
+    if jobs.session and added:
+        await pool.health_check(jobs.session)
     await message.reply_text(f"✅ Added {len(added)} worker(s).\n\n" + pool.summary())
 
 
@@ -1639,12 +1775,16 @@ async def do_broadcast(client: Client, src: Message, status: Message) -> None:
 
 @app.on_message(admin_filter & filters.command("broadcast"))
 async def cmd_broadcast(client: Client, message: Message) -> None:
+    pending_input.pop(message.from_user.id, None)
     src = message.reply_to_message
     if not src:
-        text = message.text.split(None, 1)
+        text = (message.text or message.caption or "").split(None, 1)
         if len(text) < 2:
             return await message.reply_text("Reply to a message with /broadcast, or <code>/broadcast TEXT</code>.")
-        src = await message.reply_text(text[1])
+        try:
+            src = await message.reply_text(text[1])
+        except Exception:  # invalid HTML in the text → send it verbatim
+            src = await message.reply_text(text[1], parse_mode=ParseMode.DISABLED)
     status = await message.reply_text("📣 Broadcasting…")
     asyncio.create_task(do_broadcast(client, src, status))
 
@@ -1661,12 +1801,26 @@ async def on_admin_input(client: Client, message: Message) -> None:
     mode = pending_input.get(message.from_user.id)
     if not mode:
         return
-    if message.text and message.text in (BTN_LANG, BTN_PREMIUM, BTN_STATUS, BTN_HELP, BTN_ADMIN):
+    text = message.text or ""
+    if text in (BTN_LANG, BTN_PREMIUM, BTN_STATUS, BTN_HELP, BTN_ADMIN):
+        return
+    if text.startswith("/"):
+        # any other command (/addworker, /ban, …) was already handled in group 0;
+        # it must not be swallowed here as a worker URL / broadcast text
+        pending_input.pop(message.from_user.id, None)
         return
     pending_input.pop(message.from_user.id, None)
-    if mode == "add_worker" and message.text:
-        added = [u for u in message.text.split() if pool.add(u)]
-        await message.reply_text(f"✅ Added {len(added)} worker(s).\n\n" + pool.summary(), reply_markup=workers_kb())
+    if mode == "add_worker":
+        if not text:
+            await message.reply_text("⚠️ Please send the worker URL as text.")
+        else:
+            urls = text.split()
+            added = [u for u in urls if pool.add(u)]
+            bad = [u for u in urls if not pool.is_valid(pool.normalize(u))]
+            if jobs.session and added:
+                await pool.health_check(jobs.session)
+            note = f"\n⚠️ Ignored invalid: {html.escape(', '.join(bad))}" if bad else ""
+            await message.reply_text(f"✅ Added {len(added)} worker(s).{note}\n\n" + pool.summary(), reply_markup=workers_kb())
     elif mode == "broadcast":
         status = await message.reply_text("📣 Broadcasting…")
         asyncio.create_task(do_broadcast(client, message, status))
@@ -1713,7 +1867,7 @@ async def main() -> None:
     )
     jobs.session = aiohttp.ClientSession(connector=connector, headers={"User-Agent": "EpubTranslatorBot/2.0"})
     tasks = [asyncio.create_task(keep_alive_loop())]
-    tasks += [asyncio.create_task(jobs.worker_loop(app, i + 1)) for i in range(Config.MAX_CONCURRENT_JOBS)]
+    tasks += [asyncio.create_task(jobs.worker_loop(app, i + 1)) for i in range(max(1, Config.MAX_CONCURRENT_JOBS))]
     log.info("Bot @%s started · %d workers · %d job slots", me.username, len(pool.workers), Config.MAX_CONCURRENT_JOBS)
     if Config.OWNER_ID:
         try:
@@ -1723,6 +1877,7 @@ async def main() -> None:
     await idle()
     for t in tasks:
         t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     await jobs.session.close()
     await app.stop()
     log.info("Bot stopped")
