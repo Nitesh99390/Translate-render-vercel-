@@ -40,7 +40,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-from bs4 import BeautifulSoup, NavigableString, Comment
+import warnings
+from bs4 import BeautifulSoup, NavigableString
+from bs4.element import PreformattedString, Script, Stylesheet, TemplateString
+
+try:  # bs4 >= 4.11 warns when XHTML is parsed with an HTML parser — intended here
+    from bs4 import XMLParsedAsHTMLWarning
+
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except Exception:  # pragma: no cover
+    pass
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
@@ -759,13 +768,26 @@ SKIP_TAGS = {"script", "style", "code", "pre", "svg", "math", "head", "title", "
 DOC_EXT = (".xhtml", ".html", ".htm", ".xml")
 _ws_re = re.compile(r"^(\s*)(.*?)(\s*)$", re.S)
 
-# lxml is ~5-10x faster than html.parser on big chapters; fall back if missing.
+# Non-text string nodes that must never be translated or counted.
+#   PreformattedString = Comment, CData, ProcessingInstruction (<?xml ...?>),
+#                        Declaration, Doctype (<!DOCTYPE ...>)
+#   Script / Stylesheet / TemplateString = contents of <script>/<style>/<template>
+# Different parsers expose these differently (html.parser yields the <?xml ?>
+# prolog as a ProcessingInstruction, lxml as a Comment) — filtering by type
+# makes segment/char counts identical no matter which parser is in use.
+_NON_TEXT_TYPES = (PreformattedString, Script, Stylesheet, TemplateString)
+
+# lxml is ~5-10x faster than html.parser on big chapters and is the reference
+# parser for reproducible counts; fall back only if it is missing.
 try:
     import lxml  # noqa: F401
 
     HTML_PARSER = "lxml"
 except Exception:  # pragma: no cover
     HTML_PARSER = "html.parser"
+    logging.getLogger("epubbot").warning(
+        "lxml not installed — falling back to html.parser (slower). Install lxml for best results."
+    )
 
 
 class EpubTranslator:
@@ -787,11 +809,19 @@ class EpubTranslator:
 
     @staticmethod
     def _collect(soup: BeautifulSoup) -> List[NavigableString]:
+        """Return only *human-readable* text nodes, in document order.
+
+        Deterministic across parsers: the XML prolog, DOCTYPE, comments, CDATA,
+        <script>/<style> bodies and anything under SKIP_TAGS are excluded, so the
+        same EPUB always yields the same segment and character counts."""
         nodes: List[NavigableString] = []
         for node in soup.find_all(string=True):
-            if isinstance(node, Comment) or not node.strip():
+            if isinstance(node, _NON_TEXT_TYPES):
                 continue
-            if not any(ch.isalpha() for ch in node):  # numbers / punctuation only
+            text = str(node)
+            if not text.strip():
+                continue
+            if not any(ch.isalpha() for ch in text):  # numbers / punctuation only
                 continue
             if any(p.name in SKIP_TAGS for p in node.parents if p.name):
                 continue
