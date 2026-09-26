@@ -46,3 +46,19 @@ Then in Telegram: `/admin` → **Workers** → **Add worker** → paste the Rend
 | Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub |
 
 All settings via environment variables — see `.env.example`.
+
+## Performance
+
+The master fans a book out to **all workers and Google directly at the same time**:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `MAX_PARALLEL_REQUESTS` | 48 | total in-flight requests per job |
+| `WORKER_CONCURRENCY` | 8 | parallel requests each Render/Vercel worker gets |
+| `DIRECT_CONCURRENCY` | 6 | requests the master itself sends to Google in parallel (0 = fallback only) |
+| `BATCH_MAX_ITEMS` / `BATCH_MAX_CHARS` | 150 / 9000 | segments / chars per request |
+
+EPUB parsing and re-zipping run in a worker thread (lxml), so the event loop is
+never blocked while requests are in flight. Failed big batches are split in half
+and retried instead of being dropped. Typical: 14M-char novel ≈ 4–6 min with
+6 workers + direct.

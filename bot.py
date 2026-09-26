@@ -103,9 +103,18 @@ class Config:
     PREMIUM_MAX_FILE_MB = _env_int("PREMIUM_MAX_FILE_MB", 200)
 
     MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2)
-    MAX_PARALLEL_REQUESTS = _env_int("MAX_PARALLEL_REQUESTS", 8)
-    BATCH_MAX_ITEMS = _env_int("BATCH_MAX_ITEMS", 40)
-    BATCH_MAX_CHARS = _env_int("BATCH_MAX_CHARS", 4500)
+    # ── throughput tuning ──────────────────────────────────────────────
+    # Total in-flight translate requests per job (across all workers + direct).
+    MAX_PARALLEL_REQUESTS = _env_int("MAX_PARALLEL_REQUESTS", 48)
+    # How many requests a single remote worker may serve at once.
+    WORKER_CONCURRENCY = _env_int("WORKER_CONCURRENCY", 8)
+    # How many requests the master itself sends straight to Google in parallel
+    # (0 = master only used as fallback when every worker is down).
+    DIRECT_CONCURRENCY = _env_int("DIRECT_CONCURRENCY", 6)
+    # Bigger batches = far fewer round-trips.  Google's gtx endpoint copes fine
+    # with ~10k chars / ~150 items per POST.
+    BATCH_MAX_ITEMS = _env_int("BATCH_MAX_ITEMS", 150)
+    BATCH_MAX_CHARS = _env_int("BATCH_MAX_CHARS", 9000)
     REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 60)
     WORKER_FAIL_THRESHOLD = _env_int("WORKER_FAIL_THRESHOLD", 5)
     WORKER_PING_INTERVAL = _env_int("WORKER_PING_INTERVAL", 480)  # seconds
@@ -387,14 +396,23 @@ class Worker:
     latency: float = 0.0  # moving average, seconds
     last_seen: float = 0.0
     disabled_until: float = 0.0
+    capacity: int = 0     # 0 → Config.WORKER_CONCURRENCY
 
     @property
     def available(self) -> bool:
         return self.enabled and (self.healthy or time.time() > self.disabled_until)
 
+    @property
+    def max_inflight(self) -> int:
+        return self.capacity or Config.WORKER_CONCURRENCY
+
+    @property
+    def has_slot(self) -> bool:
+        return self.inflight < self.max_inflight
+
     def score(self) -> float:
-        # lower is better – prefer idle & fast workers
-        return self.inflight * 2 + self.latency
+        # lower is better – prefer least-loaded (relative to capacity) & fastest
+        return self.inflight / max(self.max_inflight, 1) + min(self.latency, 5.0) / 10
 
     def report(self, ok: bool, latency: float = 0.0) -> None:
         if ok:
@@ -454,11 +472,16 @@ class WorkerPool:
     def available(self) -> List[Worker]:
         return [w for w in self.workers.values() if w.available]
 
-    def pick(self, exclude: Optional[set] = None) -> Optional[Worker]:
+    def pick(self, exclude: Optional[set] = None, need_slot: bool = True) -> Optional[Worker]:
         avail = [w for w in self.available() if not exclude or w.url not in exclude]
+        if need_slot:
+            avail = [w for w in avail if w.has_slot]
         if not avail:
             return None
         return min(avail, key=Worker.score)
+
+    def total_capacity(self) -> int:
+        return sum(w.max_inflight for w in self.available())
 
     async def health_check(self, session: aiohttp.ClientSession) -> None:
         for w in list(self.workers.values()):
@@ -492,18 +515,33 @@ class WorkerPool:
                 state = "🔴 down"
             lines.append(
                 f"{i}. <code>{html.escape(w.url)}</code>\n"
-                f"   {state} · {w.latency*1000:.0f} ms · ok {w.ok} · busy {w.inflight}"
+                f"   {state} · {w.latency*1000:.0f} ms · ok {w.ok} · busy {w.inflight}/{w.max_inflight}"
+            )
+        if Config.DIRECT_CONCURRENCY > 0:
+            lines.append(
+                f"⭐ <i>master → Google direct</i> · {direct_worker.latency*1000:.0f} ms · "
+                f"ok {direct_worker.ok} · busy {direct_worker.inflight}/{direct_worker.max_inflight}"
             )
         return "\n".join(lines)
 
 
 pool = WorkerPool()
 
+# The master itself is also a translation endpoint ("direct" → Google).  It is
+# used *in parallel* with the remote workers, not only as a fallback, so the
+# Oracle VM's own bandwidth is never idle.
+DIRECT_URL = "direct"
+direct_worker = Worker(url=DIRECT_URL, capacity=max(Config.DIRECT_CONCURRENCY, 1))
+direct_worker.enabled = Config.DIRECT_CONCURRENCY > 0 or Config.DIRECT_FALLBACK
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  TRANSLATION ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/t"
+GOOGLE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
 
 
 class TranslationError(Exception):
@@ -511,16 +549,54 @@ class TranslationError(Exception):
 
 
 class Translator:
-    """Batches text → workers (round-robin/least-loaded) with retries and fallback."""
+    """Batches text → workers + direct Google in parallel, least-loaded routing,
+    per-endpoint concurrency caps, retries and fallback."""
 
     def __init__(self, session: aiohttp.ClientSession, lang: str):
         self.session = session
         self.lang = lang
         self.sem = asyncio.Semaphore(Config.MAX_PARALLEL_REQUESTS)
         self.cache: Dict[str, str] = {}
+        self._slot_freed = asyncio.Event()
+
+    # ── endpoint selection ─────────────────────────────────────────────────────
+
+    def _candidates(self, tried: set) -> List[Worker]:
+        cands = [w for w in pool.available() if w.url not in tried]
+        if Config.DIRECT_CONCURRENCY > 0 and direct_worker.available and DIRECT_URL not in tried:
+            cands.append(direct_worker)
+        return cands
+
+    async def _acquire(self, tried: set) -> Optional[Worker]:
+        """Return the best endpoint that has a free slot, waiting if all are saturated."""
+        deadline = time.monotonic() + Config.REQUEST_TIMEOUT
+        while True:
+            cands = self._candidates(tried)
+            if not cands:
+                return None
+            free = [w for w in cands if w.has_slot]
+            if free:
+                w = min(free, key=Worker.score)
+                w.inflight += 1
+                return w
+            if time.monotonic() > deadline:
+                # everything saturated for a long time – just queue on the least loaded
+                w = min(cands, key=Worker.score)
+                w.inflight += 1
+                return w
+            self._slot_freed.clear()
+            try:
+                await asyncio.wait_for(self._slot_freed.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+
+    def _release(self, w: Worker) -> None:
+        w.inflight = max(0, w.inflight - 1)
+        self._slot_freed.set()
+
+    # ── transports ───────────────────────────────────────────────────────────────
 
     async def _via_worker(self, w: Worker, texts: List[str]) -> Optional[List[str]]:
-        w.inflight += 1
         t0 = time.monotonic()
         try:
             headers = {"X-Worker-Key": Config.WORKER_SECRET} if Config.WORKER_SECRET else None
@@ -535,50 +611,73 @@ class Translator:
                 data = await r.json(content_type=None)
             out = data.get("translated") if data.get("success") else None
             if not isinstance(out, list) or len(out) != len(texts):
-                raise TranslationError("bad worker response")
+                raise TranslationError(data.get("error") or "bad worker response")
             w.report(True, time.monotonic() - t0)
             return [str(x) for x in out]
         except Exception as e:
             w.report(False)
             log.debug("worker %s failed: %s", w.url, e)
             return None
-        finally:
-            w.inflight -= 1
 
     async def _direct(self, texts: List[str]) -> Optional[List[str]]:
+        t0 = time.monotonic()
         try:
             params = {"client": "gtx", "sl": "auto", "tl": self.lang}
             payload = [("q", t) for t in texts]
             async with self.session.post(
-                GOOGLE_URL, params=params, data=payload,
+                GOOGLE_URL, params=params, data=payload, headers=GOOGLE_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
             ) as r:
+                if r.status == 429:
+                    # rate-limited: back off this endpoint briefly so workers take the load
+                    direct_worker.healthy = False
+                    direct_worker.disabled_until = time.time() + 15
+                    return None
                 if r.status != 200:
                     return None
                 res = await r.json(content_type=None)
-            out = [x[0] if isinstance(x, list) else x for x in res]
-            return [str(x) for x in out] if len(out) == len(texts) else None
+            if len(texts) == 1 and isinstance(res, list) and res and isinstance(res[0], str):
+                out = [res[0]]
+            else:
+                out = [x[0] if isinstance(x, list) else x for x in res]
+            if len(out) != len(texts):
+                return None
+            direct_worker.report(True, time.monotonic() - t0)
+            return [str(x) for x in out]
         except Exception as e:
             log.debug("direct google failed: %s", e)
             return None
+
+    async def _send(self, w: Worker, texts: List[str]) -> Optional[List[str]]:
+        try:
+            if w.url == DIRECT_URL:
+                return await self._direct(texts)
+            return await self._via_worker(w, texts)
+        finally:
+            self._release(w)
 
     async def translate_batch(self, texts: List[str]) -> List[str]:
         if not texts:
             return []
         async with self.sem:
             tried: set = set()
-            for _ in range(4):
-                w = pool.pick(exclude=tried)
+            for attempt in range(5):
+                w = await self._acquire(tried)
                 if w is None:
                     break
                 tried.add(w.url)
-                out = await self._via_worker(w, texts)
+                out = await self._send(w, texts)
                 if out is not None:
                     return out
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3 * (attempt + 1))
+            # last resort: hit Google directly even if DIRECT_CONCURRENCY == 0
             if Config.DIRECT_FALLBACK:
                 for attempt in range(2):
-                    out = await self._direct(texts)
+                    direct_worker.inflight += 1
+                    try:
+                        out = await self._direct(texts)
+                    finally:
+                        self._release(direct_worker)
                     if out is not None:
                         return out
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -608,10 +707,31 @@ class Translator:
 
         done = failed = 0
 
+        async def translate_or_split(batch: List[str]) -> List[str]:
+            """Big batches are fast, but if one fails we halve it instead of
+            dropping 150 segments back to the source language."""
+            try:
+                return await self.translate_batch(batch)
+            except TranslationError:
+                if len(batch) <= 4:
+                    raise
+                mid = len(batch) // 2
+                left, right = await asyncio.gather(
+                    translate_or_split(batch[:mid]), translate_or_split(batch[mid:]),
+                    return_exceptions=True,
+                )
+                if isinstance(left, BaseException) and isinstance(right, BaseException):
+                    raise TranslationError("batch failed")
+                if isinstance(left, BaseException):
+                    left = batch[:mid]
+                if isinstance(right, BaseException):
+                    right = batch[mid:]
+                return list(left) + list(right)
+
         async def run(batch: List[str]) -> None:
             nonlocal done, failed
             try:
-                out = await self.translate_batch(batch)
+                out = await translate_or_split(batch)
             except TranslationError:
                 failed += 1
                 out = batch  # keep original text rather than lose content
@@ -639,10 +759,21 @@ SKIP_TAGS = {"script", "style", "code", "pre", "svg", "math", "head", "title", "
 DOC_EXT = (".xhtml", ".html", ".htm", ".xml")
 _ws_re = re.compile(r"^(\s*)(.*?)(\s*)$", re.S)
 
+# lxml is ~5-10x faster than html.parser on big chapters; fall back if missing.
+try:
+    import lxml  # noqa: F401
+
+    HTML_PARSER = "lxml"
+except Exception:  # pragma: no cover
+    HTML_PARSER = "html.parser"
+
 
 class EpubTranslator:
     """Translates every text node of every XHTML doc inside the EPUB,
-    keeping tags, attributes, CSS, images and package structure intact."""
+    keeping tags, attributes, CSS, images and package structure intact.
+
+    All CPU-heavy work (unzip, HTML parse, serialise, re-zip) runs in a thread
+    so the event loop stays free to drive dozens of concurrent HTTP requests."""
 
     def __init__(self, translator: Translator):
         self.tr = translator
@@ -654,7 +785,8 @@ class EpubTranslator:
         low = name.lower()
         return low.endswith(DOC_EXT) and not low.endswith(("container.xml", ".opf", ".ncx")) and "meta-inf/" not in low
 
-    def _collect(self, soup: BeautifulSoup) -> List[NavigableString]:
+    @staticmethod
+    def _collect(soup: BeautifulSoup) -> List[NavigableString]:
         nodes: List[NavigableString] = []
         for node in soup.find_all(string=True):
             if isinstance(node, Comment) or not node.strip():
@@ -666,68 +798,83 @@ class EpubTranslator:
             nodes.append(node)
         return nodes
 
-    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+    # ── blocking helpers (run via asyncio.to_thread) ───────────────────────────────────────
+
+    def _parse_all(self, src: Path):
         with zipfile.ZipFile(src) as zin:
             names = zin.namelist()
             docs = [n for n in names if self._is_doc(n)]
             if not docs:
                 raise TranslationError("No readable chapters found in EPUB")
-
-            # 1) parse all docs and collect text nodes
             parsed: List[Tuple[str, BeautifulSoup, List[NavigableString]]] = []
             all_texts: List[str] = []
             for n in docs:
                 raw = zin.read(n)
-                soup = BeautifulSoup(raw, "html.parser")
+                soup = BeautifulSoup(raw, HTML_PARSER)
                 nodes = self._collect(soup)
                 parsed.append((n, soup, nodes))
                 for node in nodes:
                     m = _ws_re.match(str(node))
-                    core = m.group(2) if m else str(node)
-                    all_texts.append(core)
-            self.segments = len(all_texts)
-            self.chars = sum(len(t) for t in all_texts)
-            if self.segments == 0:
-                raise TranslationError("EPUB contains no translatable text")
+                    all_texts.append(m.group(2) if m else str(node))
 
-            # 2) translate in one pooled pass
-            translated = await self.tr.translate_many(all_texts, progress)
-
-            # 3) write nodes back
-            i = 0
-            new_content: Dict[str, bytes] = {}
-            for n, soup, nodes in parsed:
-                for node in nodes:
-                    m = _ws_re.match(str(node))
-                    lead, _, trail = (m.group(1), m.group(2), m.group(3)) if m else ("", "", "")
-                    node.replace_with(NavigableString(f"{lead}{translated[i]}{trail}"))
-                    i += 1
-                new_content[n] = str(soup).encode("utf-8")
-
-            # 4) also translate <dc:title> in OPF and navLabels in NCX (cheap, nice to have)
+            ncx_docs: List[Tuple[str, BeautifulSoup, list]] = []
             for n in names:
-                low = n.lower()
-                if low.endswith(".ncx"):
+                if n.lower().endswith(".ncx"):
                     try:
                         ncx = BeautifulSoup(zin.read(n), "xml")
                         labels = [t for t in ncx.find_all("text") if t.string and t.string.strip()]
                         if labels:
-                            out = await self.tr.translate_many([t.string.strip() for t in labels])
-                            for t, s in zip(labels, out):
-                                t.string = s
-                            new_content[n] = str(ncx).encode("utf-8")
+                            ncx_docs.append((n, ncx, labels))
                     except Exception as e:
                         log.debug("ncx skip: %s", e)
+        return names, parsed, all_texts, ncx_docs
 
-            # 5) rebuild zip – mimetype MUST be first and stored
-            with zipfile.ZipFile(dst, "w") as zout:
-                if "mimetype" in names:
-                    zout.writestr("mimetype", zin.read("mimetype"), compress_type=zipfile.ZIP_STORED)
-                for info in zin.infolist():
-                    if info.filename == "mimetype":
-                        continue
-                    data = new_content.get(info.filename, zin.read(info.filename))
-                    zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+    @staticmethod
+    def _apply_and_write(src: Path, dst: Path, names, parsed, translated, ncx_docs, ncx_out) -> None:
+        i = 0
+        new_content: Dict[str, bytes] = {}
+        for n, soup, nodes in parsed:
+            for node in nodes:
+                m = _ws_re.match(str(node))
+                lead, _, trail = (m.group(1), m.group(2), m.group(3)) if m else ("", "", "")
+                node.replace_with(NavigableString(f"{lead}{translated[i]}{trail}"))
+                i += 1
+            new_content[n] = str(soup).encode("utf-8")
+
+        j = 0
+        for n, ncx, labels in ncx_docs:
+            for t in labels:
+                t.string = ncx_out[j]
+                j += 1
+            new_content[n] = str(ncx).encode("utf-8")
+
+        # rebuild zip – mimetype MUST be first and stored
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+            if "mimetype" in names:
+                zout.writestr("mimetype", zin.read("mimetype"), compress_type=zipfile.ZIP_STORED)
+            for info in zin.infolist():
+                if info.filename == "mimetype":
+                    continue
+                data = new_content.get(info.filename, zin.read(info.filename))
+                zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+
+    # ── public ───────────────────────────────────────────────────────────────────────
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+        # 1) parse (thread)
+        names, parsed, all_texts, ncx_docs = await asyncio.to_thread(self._parse_all, src)
+        self.segments = len(all_texts)
+        self.chars = sum(len(t) for t in all_texts)
+        if self.segments == 0:
+            raise TranslationError("EPUB contains no translatable text")
+
+        # 2) translate everything in one pooled pass (chapters + TOC labels together)
+        ncx_texts = [t.string.strip() for _, _, labels in ncx_docs for t in labels]
+        out = await self.tr.translate_many(all_texts + ncx_texts, progress)
+        translated, ncx_out = out[: len(all_texts)], out[len(all_texts):]
+
+        # 3) write back + re-zip (thread)
+        await asyncio.to_thread(self._apply_and_write, src, dst, names, parsed, translated, ncx_docs, ncx_out)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  JOB QUEUE
@@ -840,15 +987,18 @@ class JobQueue:
                 return
             last_edit = now
             pct = int(done * 100 / max(total, 1))
-            eta = ""
-            if done:
-                remaining = (now - t0) / done * (total - done)
+            eta = speed = ""
+            elapsed_now = now - t0
+            if done and elapsed_now > 0:
+                remaining = elapsed_now / done * (total - done)
                 eta = f" · ETA {int(remaining)}s"
+                speed = f" · {int(epub.chars * done / total / elapsed_now / 1000)}k ch/s"
+            endpoints = len(pool.available()) + (1 if Config.DIRECT_CONCURRENCY > 0 else 0)
             await safe_edit(
                 job.status_msg,
                 f"⚙️ <b>Translating…</b> {progress_bar(pct)} {pct}%\n"
                 f"📄 {html.escape(job.file_name)}\n"
-                f"🌐 → {lang_name(job.lang)} · {epub.segments} segments · {len(pool.available())} worker(s){eta}",
+                f"🌐 → {lang_name(job.lang)} · {epub.segments:,} segments · {endpoints} endpoint(s){speed}{eta}",
                 cancel_kb(job.id),
             )
 
@@ -861,7 +1011,7 @@ class JobQueue:
             f"✅ <b>Translation complete</b>\n"
             f"📄 {html.escape(job.file_name)}\n"
             f"🌐 {lang_name(job.lang)} · {epub.segments:,} segments · {epub.chars:,} chars\n"
-            f"⏱ {elapsed:.0f}s"
+            f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s · {int(epub.chars / max(elapsed, 1) / 1000)}k chars/s"
         )
         await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
         try:
@@ -1524,7 +1674,13 @@ async def keep_alive_loop() -> None:
 async def main() -> None:
     await app.start()
     me = await app.get_me()
-    connector = aiohttp.TCPConnector(limit=Config.MAX_PARALLEL_REQUESTS * 2, ttl_dns_cache=300)
+    # enough sockets for every job slot to run at full parallelism, keep-alive on
+    connector = aiohttp.TCPConnector(
+        limit=Config.MAX_PARALLEL_REQUESTS * Config.MAX_CONCURRENT_JOBS + 16,
+        limit_per_host=0,
+        ttl_dns_cache=300,
+        keepalive_timeout=60,
+    )
     jobs.session = aiohttp.ClientSession(connector=connector, headers={"User-Agent": "EpubTranslatorBot/2.0"})
     tasks = [asyncio.create_task(keep_alive_loop())]
     tasks += [asyncio.create_task(jobs.worker_loop(app, i + 1)) for i in range(Config.MAX_CONCURRENT_JOBS)]
