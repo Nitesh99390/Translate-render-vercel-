@@ -1,6 +1,6 @@
 # EPUB Translator Bot
 
-Telegram bot that translates EPUB books while preserving formatting.
+Telegram bot that translates **EPUB · PDF · DOCX · TXT/MD · HTML** files while preserving formatting.
 Master runs on an Oracle VM; stateless translation workers run on Render / Vercel.
 
 ```
@@ -44,8 +44,21 @@ Then in Telegram: `/admin` → **Workers** → **Add worker** → paste the Rend
 | 20 languages, live progress bar + ETA, cancel button | Add / pause / remove workers, health check |
 | Free daily limit, premium (Razorpay auto-verify) | `/addpremium /revoke /ban /unban /user /broadcast` |
 | Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub |
+| Formats: EPUB, PDF (layout kept, Noto fonts auto-downloaded), DOCX, TXT/MD, HTML | Output is returned in the same format |
 
 All settings via environment variables — see `.env.example`.
+
+## Supported formats
+
+| Input | How it is translated | What stays intact |
+|---|---|---|
+| `.epub` | every text node of every chapter + NCX labels | chapters, CSS, images, links, TOC |
+| `.pdf` | each text block is redacted and re-typed in the same box with a Unicode Noto font (auto-shrinks to fit) | page layout, images, vector art, links. Scanned/image-only PDFs are rejected (no OCR) |
+| `.docx` | `<w:t>` runs of body, headers, footers, foot/endnotes (runs of one paragraph are merged so sentences translate as a whole) | styles, tables, images, numbering |
+| `.txt` `.md` | line by line | blank lines, indentation, CRLF |
+| `.html` `.htm` `.xhtml` | text nodes + `<title>` | tags, attributes, scripts, CSS |
+
+Fonts for PDF output are fetched from Google Noto on first use and cached in `DATA_DIR/fonts`.
 
 ## Performance
 

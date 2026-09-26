@@ -74,6 +74,11 @@ try:
 except Exception:  # razorpay is optional
     razorpay = None
 
+try:
+    import pymupdf  # type: ignore  # PDF support (PyMuPDF)
+except Exception:  # pragma: no cover
+    pymupdf = None
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -974,6 +979,387 @@ class EpubTranslator:
         # 3) write back + re-zip (thread)
         await asyncio.to_thread(self._apply_and_write, src, dst, names, parsed, translated, ncx_docs, ncx_out)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  OTHER FORMATS: TXT · HTML · DOCX · PDF  (same Translator, same progress API)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# extension -> (kind, human label).  Input & output keep the same extension.
+SUPPORTED_FORMATS: Dict[str, Tuple[str, str]] = {
+    ".epub": ("epub", "EPUB"),
+    ".txt": ("txt", "Text"),
+    ".md": ("txt", "Markdown"),
+    ".html": ("html", "HTML"),
+    ".htm": ("html", "HTML"),
+    ".xhtml": ("html", "XHTML"),
+    ".docx": ("docx", "Word"),
+    ".pdf": ("pdf", "PDF"),
+}
+MIME_TO_EXT = {
+    "application/epub+zip": ".epub",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/html": ".html",
+    "application/xhtml+xml": ".xhtml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/pdf": ".pdf",
+}
+
+
+def detect_format(file_name: str, mime: Optional[str]) -> Optional[str]:
+    """Return the canonical extension ('.epub', '.pdf', …) or None if unsupported."""
+    ext = Path(file_name or "").suffix.lower()
+    if ext in SUPPORTED_FORMATS:
+        return ext
+    return MIME_TO_EXT.get((mime or "").split(";")[0].strip().lower())
+
+
+def _decode_text(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+class BaseDocTranslator:
+    def __init__(self, translator: Translator):
+        self.tr = translator
+        self.segments = 0
+        self.chars = 0
+
+    def _count(self, texts: List[str], what: str) -> None:
+        self.segments = len(texts)
+        self.chars = sum(len(t) for t in texts)
+        if self.segments == 0:
+            raise TranslationError(f"{what} contains no translatable text")
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+
+class TxtTranslator(BaseDocTranslator):
+    """Plain text / Markdown: translate paragraph by paragraph, keep blank lines,
+    indentation and line endings exactly as they were."""
+
+    _para_re = re.compile(r"([^\n]+)")
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+        text = _decode_text(await asyncio.to_thread(src.read_bytes))
+        nl = "\r\n" if "\r\n" in text else "\n"
+        lines = text.split("\n")
+        idx: List[int] = []
+        texts: List[str] = []
+        for i, line in enumerate(lines):
+            core = line.strip("\r")
+            m = _ws_re.match(core)
+            body = m.group(2) if m else core
+            if body and any(ch.isalpha() for ch in body):
+                idx.append(i)
+                texts.append(body)
+        self._count(texts, "File")
+        out = await self.tr.translate_many(texts, progress)
+        for i, t in zip(idx, out):
+            core = lines[i].strip("\r")
+            m = _ws_re.match(core)
+            lead, trail = (m.group(1), m.group(3)) if m else ("", "")
+            lines[i] = f"{lead}{t}{trail}"
+        await asyncio.to_thread(dst.write_bytes, nl.join(lines).encode("utf-8"))
+
+
+class HtmlTranslator(BaseDocTranslator):
+    """Stand-alone HTML/XHTML file: same text-node approach as EPUB chapters."""
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+        raw = await asyncio.to_thread(src.read_bytes)
+        soup = await asyncio.to_thread(BeautifulSoup, raw, HTML_PARSER)
+        nodes = EpubTranslator._collect(soup)
+        texts = []
+        for node in nodes:
+            m = _ws_re.match(str(node))
+            texts.append(m.group(2) if m else str(node))
+        # <title> is skipped by _collect (inside <head>) — translate it too
+        title = soup.title if soup.title and soup.title.string and soup.title.string.strip() else None
+        if title:
+            texts.append(title.string.strip())
+        self._count(texts, "HTML")
+        out = await self.tr.translate_many(texts, progress)
+
+        def apply() -> None:
+            for node, t in zip(nodes, out):
+                m = _ws_re.match(str(node))
+                lead, trail = (m.group(1), m.group(3)) if m else ("", "")
+                node.replace_with(NavigableString(f"{lead}{t}{trail}"))
+            if title:
+                title.string = out[-1]
+            dst.write_bytes(EpubTranslator._serialize(soup, raw))
+
+        await asyncio.to_thread(apply)
+
+
+class DocxTranslator(BaseDocTranslator):
+    """DOCX is a zip of XML.  We translate every <w:t> run text in
+    word/document.xml, headers, footers, footnotes and endnotes.  Styles,
+    images, tables, numbering, comments … are byte-for-byte untouched.
+
+    Runs that belong to the same paragraph are merged (Word splits a
+    sentence into many <w:t> for spell-check / formatting reasons) so the
+    translation sees whole sentences; the result is written back into the
+    first run of each group and the rest are emptied — the group keeps the
+    formatting of its first run."""
+
+    _parts_re = re.compile(r"^word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$")
+
+    def _parse(self, src: Path):
+        # lxml keeps namespace prefixes / mc:Ignorable declarations intact;
+        # stdlib ElementTree would rewrite them to ns0:, which Word rejects.
+        from lxml import etree as ET
+
+        W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        parsed = []  # (name, tree, groups)  groups: list of list[Element w:t]
+        texts: List[str] = []
+        with zipfile.ZipFile(src) as z:
+            names = z.namelist()
+            for n in names:
+                if not self._parts_re.match(n):
+                    continue
+                tree = ET.fromstring(z.read(n))
+                groups: List[List] = []
+                for p in tree.iter(f"{W}p"):
+                    runs = [t for t in p.iter(f"{W}t") if t.text]
+                    if not runs:
+                        continue
+                    # split a paragraph into groups at tabs/breaks so layout survives
+                    group: List = []
+                    for r in p.iter():
+                        if r.tag == f"{W}t" and r.text:
+                            group.append(r)
+                        elif r.tag in (f"{W}tab", f"{W}br", f"{W}cr") and group:
+                            groups.append(group)
+                            group = []
+                    if group:
+                        groups.append(group)
+                kept: List[List] = []
+                for g in groups:
+                    joined = "".join(t.text for t in g)
+                    if joined.strip() and any(ch.isalpha() for ch in joined):
+                        kept.append(g)
+                        texts.append(joined.strip())
+                if kept:
+                    parsed.append((n, tree, kept))
+        return names, parsed, texts
+
+    @staticmethod
+    def _write(src: Path, dst: Path, names, parsed, out: List[str]) -> None:
+        from lxml import etree as ET
+
+        XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+        i = 0
+        new: Dict[str, bytes] = {}
+        for n, tree, groups in parsed:
+            for g in groups:
+                joined = "".join(t.text for t in g)
+                lead = joined[: len(joined) - len(joined.lstrip())]
+                trail = joined[len(joined.rstrip()):]
+                g[0].text = f"{lead}{out[i]}{trail}"
+                g[0].set(XML_SPACE, "preserve")
+                for t in g[1:]:
+                    t.text = ""
+                i += 1
+            new[n] = ET.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                if info.filename.endswith("/"):
+                    continue
+                data = new.get(info.filename)
+                if data is None:
+                    zout.writestr(info, zin.read(info.filename))
+                else:
+                    zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zout.writestr(zi, data)
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+        if not zipfile.is_zipfile(src):
+            raise TranslationError("Not a valid DOCX file (old .doc format is not supported — save as .docx)")
+        names, parsed, texts = await asyncio.to_thread(self._parse, src)
+        self._count(texts, "Document")
+        out = await self.tr.translate_many(texts, progress)
+        await asyncio.to_thread(self._write, src, dst, names, parsed, out)
+
+
+# Fonts for PDF output.  PDF text is drawn with the font embedded in the file,
+# which almost never has Devanagari / Bengali / Arabic … glyphs, so we bring
+# our own (Google Noto, OFL licence).  Downloaded once, cached in DATA_DIR/fonts.
+_NOTO = "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/{0}/hinted/ttf/{0}-Regular.ttf"
+PDF_FONTS: Dict[str, Tuple[str, str]] = {  # lang -> (file name, url)
+    "hi": ("NotoSansDevanagari-Regular.ttf", _NOTO.format("NotoSansDevanagari")),
+    "mr": ("NotoSansDevanagari-Regular.ttf", _NOTO.format("NotoSansDevanagari")),
+    "ne": ("NotoSansDevanagari-Regular.ttf", _NOTO.format("NotoSansDevanagari")),
+    "bn": ("NotoSansBengali-Regular.ttf", _NOTO.format("NotoSansBengali")),
+    "ta": ("NotoSansTamil-Regular.ttf", _NOTO.format("NotoSansTamil")),
+    "te": ("NotoSansTelugu-Regular.ttf", _NOTO.format("NotoSansTelugu")),
+    "gu": ("NotoSansGujarati-Regular.ttf", _NOTO.format("NotoSansGujarati")),
+    "kn": ("NotoSansKannada-Regular.ttf", _NOTO.format("NotoSansKannada")),
+    "ml": ("NotoSansMalayalam-Regular.ttf", _NOTO.format("NotoSansMalayalam")),
+    "pa": ("NotoSansGurmukhi-Regular.ttf", _NOTO.format("NotoSansGurmukhi")),
+    "ur": ("NotoNastaliqUrdu-Regular.ttf", _NOTO.format("NotoNastaliqUrdu")),
+    "ar": ("NotoSansArabic-Regular.ttf", _NOTO.format("NotoSansArabic")),
+    "zh-CN": (
+        "NotoSansCJKsc-Regular.otf",
+        "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    ),
+}
+_LATIN_FONT = ("NotoSans-Regular.ttf", _NOTO.format("NotoSans"))
+_font_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def ensure_pdf_font(session: aiohttp.ClientSession, lang: str) -> Optional[Path]:
+    """Return a local font file that can render `lang`, downloading it on first use."""
+    fname, url = PDF_FONTS.get(lang, _LATIN_FONT)
+    fdir = Config.DATA_DIR / "fonts"
+    fdir.mkdir(parents=True, exist_ok=True)
+    path = fdir / fname
+    if path.exists() and path.stat().st_size > 10_000:
+        return path
+    lock = _font_locks.setdefault(fname, asyncio.Lock())
+    async with lock:
+        if path.exists() and path.stat().st_size > 10_000:
+            return path
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    raise TranslationError(f"HTTP {r.status}")
+                data = await r.read()
+            tmp = path.with_suffix(".part")
+            await asyncio.to_thread(tmp.write_bytes, data)
+            tmp.replace(path)
+            log.info("downloaded PDF font %s (%d KB)", fname, len(data) // 1024)
+            return path
+        except Exception as e:  # noqa: BLE001
+            log.warning("font download failed (%s): %s — PDF will use built-in font", fname, e)
+            return None
+
+
+class PdfTranslator(BaseDocTranslator):
+    """Layout-preserving PDF translation.
+
+    For every text block on every page we remember its bounding box and font
+    size, remove the original glyphs with a redaction (images, vector art,
+    links and annotations stay), then type the translation back into the same
+    box with a Unicode font.  If the translation is longer than the original
+    the font is shrunk (down to 50 %) so it still fits the box."""
+
+    def __init__(self, translator: Translator, font: Optional[Path]):
+        super().__init__(translator)
+        self.font = font
+
+    @staticmethod
+    def _block_text(b: dict) -> Tuple[str, float, Tuple[float, float, float], bool]:
+        """Join the lines of a block into one string; return (text, size, rgb, bold)."""
+        parts: List[str] = []
+        sizes: List[float] = []
+        color = 0
+        bold = False
+        for line in b["lines"]:
+            ltxt = "".join(s["text"] for s in line["spans"])
+            if not ltxt.strip():
+                continue
+            for s in line["spans"]:
+                if s["text"].strip():
+                    sizes.append(s["size"])
+                    color = s.get("color", 0)
+                    bold = bold or bool(s.get("flags", 0) & 16)
+            # de-hyphenate line breaks ("transla-\ntion" → "translation")
+            if parts and parts[-1].endswith("-") and ltxt[:1].islower():
+                parts[-1] = parts[-1][:-1] + ltxt.strip()
+            else:
+                parts.append(ltxt.strip())
+        text = " ".join(parts)
+        size = sorted(sizes)[len(sizes) // 2] if sizes else 11.0
+        rgb = ((color >> 16) & 255, (color >> 8) & 255, color & 255)
+        return text, size, rgb, bold
+
+    def _parse(self, src: Path):
+        doc = pymupdf.open(src)
+        if doc.is_encrypted and not doc.authenticate(""):
+            raise TranslationError("PDF is password-protected")
+        blocks = []  # (page_no, rect, size, rgb, bold)
+        texts: List[str] = []
+        for pno, page in enumerate(doc):
+            d = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE | pymupdf.TEXT_PRESERVE_LIGATURES)
+            for b in d["blocks"]:
+                if b["type"] != 0:
+                    continue
+                text, size, rgb, bold = self._block_text(b)
+                if not text or not any(ch.isalpha() for ch in text):
+                    continue
+                blocks.append((pno, tuple(b["bbox"]), size, rgb, bold))
+                texts.append(text)
+        n_pages = len(doc)
+        doc.close()
+        if n_pages and not texts:
+            raise TranslationError("PDF has no selectable text (scanned image PDF) — OCR is not supported")
+        return blocks, texts
+
+    def _write(self, src: Path, dst: Path, blocks, out: List[str]) -> None:
+        doc = pymupdf.open(src)
+        if doc.is_encrypted:
+            doc.authenticate("")
+        css = "* { margin:0; padding:0; line-height:1.15; }"
+        archive = None
+        if self.font:
+            archive = pymupdf.Archive(str(self.font.parent))
+            css = f"@font-face {{ font-family: tr; src: url({self.font.name}); }} * {{ font-family: tr, sans-serif; margin:0; padding:0; line-height:1.15; }}"
+        by_page: Dict[int, list] = {}
+        for (pno, rect, size, rgb, bold), t in zip(blocks, out):
+            by_page.setdefault(pno, []).append((rect, size, rgb, bold, t))
+        for pno, items in by_page.items():
+            page = doc[pno]
+            for rect, *_ in items:
+                page.add_redact_annot(pymupdf.Rect(rect))
+            # remove the old text only — keep images & vector drawings
+            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+            for rect, size, rgb, bold, t in items:
+                r = pymupdf.Rect(rect)
+                # a little slack so slightly longer translations don't get shrunk
+                r.x1 = min(r.x1 + 2, page.rect.x1)
+                r.y1 = min(r.y1 + size * 0.4, page.rect.y1)
+                style = f"font-size:{size:.1f}pt; color:rgb({rgb[0]},{rgb[1]},{rgb[2]});" + (" font-weight:bold;" if bold else "")
+                body = f'<div style="{style}">{html.escape(t)}</div>'
+                try:
+                    page.insert_htmlbox(r, body, css=css, archive=archive, scale_low=0.5)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("pdf insert failed p%d: %s", pno, e)
+        doc.save(dst, garbage=3, deflate=True)
+        doc.close()
+
+    async def translate(self, src: Path, dst: Path, progress=None) -> None:
+        if pymupdf is None:
+            raise TranslationError("PDF support is not installed on the server (pip install pymupdf)")
+        blocks, texts = await asyncio.to_thread(self._parse, src)
+        self._count(texts, "PDF")
+        out = await self.tr.translate_many(texts, progress)
+        await asyncio.to_thread(self._write, src, dst, blocks, out)
+
+
+async def make_doc_translator(ext: str, translator: Translator, session: aiohttp.ClientSession, lang: str):
+    kind = SUPPORTED_FORMATS[ext][0]
+    if kind == "epub":
+        return EpubTranslator(translator)
+    if kind == "txt":
+        return TxtTranslator(translator)
+    if kind == "html":
+        return HtmlTranslator(translator)
+    if kind == "docx":
+        return DocxTranslator(translator)
+    if kind == "pdf":
+        font = await ensure_pdf_font(session, lang)
+        return PdfTranslator(translator, font)
+    raise TranslationError(f"Unsupported format {ext}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  JOB QUEUE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -990,6 +1376,7 @@ class Job:
     file_name: str = field(compare=False)
     lang: str = field(compare=False)
     status_msg: Message = field(compare=False)
+    ext: str = field(default=".epub", compare=False)
     cancelled: bool = field(default=False, compare=False)
     task: Optional[asyncio.Task] = field(default=None, compare=False)
 
@@ -1093,8 +1480,9 @@ class JobQueue:
         t0 = time.monotonic()
         last_edit = 0.0
         translator = Translator(self.session, job.lang)
-        epub = EpubTranslator(translator)
-        out_path = job.file_path.with_name(f"{Path(job.file_name).stem} [{job.lang}].epub")
+        fmt_label = SUPPORTED_FORMATS[job.ext][1]
+        epub = await make_doc_translator(job.ext, translator, self.session, job.lang)
+        out_path = job.file_path.with_name(f"{Path(job.file_name).stem} [{job.lang}]{job.ext}")
 
         async def progress(done: int, total: int) -> None:
             nonlocal last_edit
@@ -1118,11 +1506,11 @@ class JobQueue:
                 cancel_kb(job.id),
             )
 
-        await safe_edit(job.status_msg, f"🔍 <b>Analysing EPUB…</b>\n📄 {html.escape(job.file_name)}", cancel_kb(job.id))
+        await safe_edit(job.status_msg, f"🔍 <b>Analysing {fmt_label}…</b>\n📄 {html.escape(job.file_name)}", cancel_kb(job.id))
         await epub.translate(job.file_path, out_path, progress)
 
         elapsed = time.monotonic() - t0
-        await safe_edit(job.status_msg, "📤 <b>Uploading translated book…</b>")
+        await safe_edit(job.status_msg, "📤 <b>Uploading translated file…</b>")
         caption = (
             f"✅ <b>Translation complete</b>\n"
             f"📄 {html.escape(job.file_name)}\n"
@@ -1348,7 +1736,7 @@ async def cmd_start(client: Client, message: Message) -> None:
         "formatting, images and chapters intact.\n\n"
         f"🌐 Target language: <b>{lang_name(row['lang'])}</b>\n"
         f"💼 Plan: {user_line(row)}\n\n"
-        "📎 <b>Just send me an .epub file to begin.</b>",
+        "📎 <b>Send me a file to begin</b> — EPUB · PDF · DOCX · TXT · HTML",
         reply_markup=main_kb(message.from_user.id),
     )
 
@@ -1361,9 +1749,13 @@ async def cmd_help(client: Client, message: Message) -> None:
     await message.reply_text(
         "📖 <b>How it works</b>\n"
         "1. Choose your language with <b>🌐 Language</b>\n"
-        "2. Send an <b>.epub</b> file\n"
-        "3. Watch live progress, get the translated book back\n\n"
-        "✨ <b>What's preserved</b>: chapters, bold/italic, links, images, table of contents, CSS.\n\n"
+        "2. Send a file: <b>.epub · .pdf · .docx · .txt · .md · .html</b>\n"
+        "3. Watch live progress, get the translated file back in the same format\n\n"
+        "✨ <b>What's preserved</b>\n"
+        "• EPUB/HTML: chapters, bold/italic, links, images, TOC, CSS\n"
+        "• DOCX: styles, tables, images, headers/footers, footnotes\n"
+        "• PDF: page layout, images — text is replaced in place (scanned PDFs not supported)\n"
+        "• TXT/MD: line breaks and indentation\n\n"
         f"🆓 Free: {Config.FREE_DAILY_LIMIT} files/day, up to {Config.FREE_MAX_FILE_MB} MB\n"
         f"⭐ Premium: unlimited, priority queue, up to {Config.PREMIUM_MAX_FILE_MB} MB\n\n"
         "<b>Commands</b>\n"
@@ -1390,7 +1782,7 @@ async def cb_lang(client: Client, cq: CallbackQuery) -> None:
     db.upsert_user(cq.from_user.id, cq.from_user.first_name or "", cq.from_user.username)
     db.set_lang(cq.from_user.id, code)
     await cq.answer(f"Language set: {lang_name(code)}")
-    await safe_edit(cq.message, f"🌐 Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me an .epub file.")
+    await safe_edit(cq.message, f"🌐 Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me a file (EPUB · PDF · DOCX · TXT · HTML).")
 
 
 # ── status ─────────────────────────────────────────────────────────────────
@@ -1502,6 +1894,22 @@ async def cb_cancel(client: Client, cq: CallbackQuery) -> None:
 
 
 # ── documents ──────────────────────────────────────────────────────────────
+def _sniff_ok(path: Path, ext: str) -> bool:
+    """Cheap magic-byte check so we fail fast on mislabelled files."""
+    try:
+        if path.stat().st_size == 0:
+            return False
+        kind = SUPPORTED_FORMATS[ext][0]
+        if kind in ("epub", "docx"):
+            return zipfile.is_zipfile(path)
+        if kind == "pdf":
+            with open(path, "rb") as f:
+                return f.read(1024).lstrip().startswith(b"%PDF")
+        return True  # txt / html: anything goes
+    except Exception:
+        return False
+
+
 @app.on_message(filters.private & filters.document)
 async def on_document(client: Client, message: Message) -> None:
     row = await guard(client, message)
@@ -1511,9 +1919,16 @@ async def on_document(client: Client, message: Message) -> None:
     if uid in pending_input:  # admin is sending a broadcast attachment
         return
     doc = message.document
-    name = doc.file_name or "book.epub"
-    if not name.lower().endswith(".epub") and doc.mime_type != "application/epub+zip":
-        return await message.reply_text("⚠️ Only <b>.epub</b> files are supported.")
+    ext = detect_format(doc.file_name or "", doc.mime_type)
+    if not ext:
+        return await message.reply_text(
+            "⚠️ Unsupported file type.\n\nSupported: <b>" + " · ".join(sorted(SUPPORTED_FORMATS)) + "</b>"
+        )
+    if ext == ".pdf" and pymupdf is None:
+        return await message.reply_text("⚠️ PDF support is not installed on this server.")
+    name = doc.file_name or f"document{ext}"
+    if not name.lower().endswith(ext):
+        name += ext
 
     premium = db.is_premium(uid)
     max_mb = Config.PREMIUM_MAX_FILE_MB if premium else Config.FREE_MAX_FILE_MB
@@ -1536,18 +1951,18 @@ async def on_document(client: Client, message: Message) -> None:
     downloading.add(uid)
     status = await message.reply_text("📥 <b>Downloading…</b>")
     tmp_dir = Path(tempfile.mkdtemp(prefix="epub_", dir=Config.DATA_DIR))
-    safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or "book.epub"
-    if not safe_name.lower().endswith(".epub"):
-        safe_name += ".epub"
+    safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or f"document{ext}"
+    if not safe_name.lower().endswith(ext):
+        safe_name += ext
     try:
         path = await message.download(file_name=str(tmp_dir / safe_name))
     except Exception as e:  # noqa: BLE001
         log.warning("download failed for %s: %s", uid, e)
         path = None
-    if not path or not zipfile.is_zipfile(path):
+    if not path or not _sniff_ok(Path(path), ext):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         downloading.discard(uid)
-        await safe_edit(status, "❌ Download failed or this file is not a valid EPUB.")
+        await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
         return
 
     job_id = db.add_job(uid, name, row["lang"])
@@ -1561,6 +1976,7 @@ async def on_document(client: Client, message: Message) -> None:
         file_name=name,
         lang=row["lang"],
         status_msg=status,
+        ext=ext,
     )
     await jobs.submit(job)
     downloading.discard(uid)
@@ -1834,7 +2250,10 @@ async def on_text(client: Client, message: Message) -> None:
         return
     if message.from_user and Config.is_admin(message.from_user.id) and message.from_user.id in pending_input:
         return
-    await message.reply_text("📎 Send me an <b>.epub</b> file to translate, or use the menu below.", reply_markup=main_kb(message.from_user.id))
+    await message.reply_text(
+        "📎 Send me a file to translate (<b>EPUB · PDF · DOCX · TXT · HTML</b>), or use the menu below.",
+        reply_markup=main_kb(message.from_user.id),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
