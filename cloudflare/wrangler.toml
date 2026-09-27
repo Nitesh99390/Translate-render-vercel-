@@ -1,0 +1,14 @@
+# Cloudflare Workers config — free plan, no card required.
+#   cd cloudflare && npx wrangler login && npx wrangler deploy
+name = "epub-translate-worker"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[vars]
+MAX_ITEMS = "400"
+MAX_CHARS = "30000"
+# WORKER_SECRET is a secret, not a var:  npx wrangler secret put WORKER_SECRET
+
+[observability]
+enabled = true

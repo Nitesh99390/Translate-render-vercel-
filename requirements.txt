@@ -4,3 +4,6 @@ uvicorn
 aiohttp
 pydantic
 a2wsgi        # WSGI adapter, only used by wsgi.py on PythonAnywhere
+# Hugging Face (hf_app.py) additionally needs `gradio` + `spaces` — both are
+# pre-installed by the Gradio SDK / ZeroGPU image, so they are NOT listed here
+# (keeps Vercel/Render builds small). For local testing: pip install gradio

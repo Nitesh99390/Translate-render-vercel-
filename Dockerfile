@@ -1,5 +1,5 @@
-# Universal worker image — Hugging Face Spaces (Docker SDK), Fly.io, Koyeb,
-# Railway, or any VPS:  docker build -t epub-worker . && docker run -p 7860:7860 epub-worker
+# Universal worker image — Fly.io, Koyeb, Railway, any VPS (HF Docker Spaces are paid now → use hf_app.py).
+# docker build -t epub-worker . && docker run -p 7860:7860 epub-worker
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=7860
 
-# Hugging Face runs containers as uid 1000; create a matching user.
+# run as non-root
 RUN useradd -m -u 1000 worker
 WORKDIR /app
 
