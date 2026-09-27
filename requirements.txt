@@ -1,5 +1,6 @@
-# Worker (Render / Vercel) — app.py
+# Worker (Render / Vercel / Hugging Face / PythonAnywhere / Railway / Koyeb) — app.py
 fastapi
 uvicorn
 aiohttp
 pydantic
+a2wsgi        # WSGI adapter, only used by wsgi.py on PythonAnywhere
