@@ -3,8 +3,10 @@ title: EPUB Translator Worker
 emoji: 📚
 colorFrom: indigo
 colorTo: green
-sdk: docker
-app_port: 7860
+sdk: gradio
+sdk_version: 6.28.0
+python_version: "3.12"
+app_file: hf_app.py
 pinned: false
 license: mit
 ---
@@ -14,18 +16,29 @@ license: mit
 Telegram bot that translates **EPUB · PDF · DOCX · TXT/MD · HTML** files while preserving formatting.
 
 * **Master** (`bot.py`) — runs **only on your Oracle VPS**: Telegram, SQLite, queue, payments, admin panel.
-* **Workers** (`app.py`) — stateless translate nodes; deploy the *same file* on
-  **Hugging Face · PythonAnywhere · Vercel · Render · Railway · Koyeb · Fly · Docker** — as many as you like.
+* **Workers** — stateless translate nodes, all speaking the same tiny HTTP API.
+  Deploy on **Hugging Face (free ZeroGPU) · Cloudflare Workers · Render · Vercel · PythonAnywhere · Deno Deploy · Railway · Koyeb · Fly · Docker** — as many as you like, **no credit card on any of them**.
 
 ```
-Telegram ──► bot.py (Oracle VPS) ──┬─► HF Space          ──┐
-                 │ SQLite, queue,  ├─► PythonAnywhere     ├─► Google Translate
-                 │ payments, admin ├─► Vercel / Render    │
-                 │                 └─► Railway / Koyeb…  ──┘
+Telegram ──► bot.py (Oracle VPS) ──┬─► HF Space (Gradio/ZeroGPU) ──┐
+                 │ SQLite, queue,  ├─► Cloudflare Worker (JS)      │
+                 │ payments, admin ├─► Render / Vercel             ├─► Google Translate
+                 │                 ├─► PythonAnywhere / Deno       │
+                 │                 └─► Railway / Koyeb / Docker  ──┘
                  └─ direct Google fallback if all workers are down
 ```
 
-> The YAML block at the top of this file is only for Hugging Face Spaces (Docker SDK, port 7860). GitHub just shows it as a small table — ignore it.
+> The YAML block at the top of this file is only for Hugging Face Spaces (Gradio SDK → `hf_app.py`). GitHub just shows it as a small table — ignore it.
+
+### ⚠️ Hugging Face changed its free tier (mid-2026)
+
+* **Docker Spaces** now require a billing method, **Gradio on CPU Basic** needs PRO.
+* The only free route is a **Gradio Space on ZeroGPU** — allowed for free accounts that are
+  **>30 days old with a verified e-mail** (max 2 Spaces). `hf_app.py` handles the ZeroGPU
+  quirks (mandatory `@spaces.GPU` probe + startup report) while still serving the plain
+  FastAPI `/translate` endpoint on CPU — **no GPU quota is used**.
+* Everything else here (Cloudflare, Render, Vercel, PythonAnywhere, Deno) is independent of
+  HF, so you're never blocked by one provider.
 
 ---
 
@@ -33,31 +46,57 @@ Telegram ──► bot.py (Oracle VPS) ──┬─► HF Space          ──�
 
 All platforms run the same `app.py`. Only the entry point differs:
 
-| Platform | Entry file | Free tier notes |
-|---|---|---|
-| **Hugging Face Spaces** | `Dockerfile` (+ README front-matter) | always-on, 2 vCPU, best free worker |
-| **PythonAnywhere** | `wsgi.py` (a2wsgi adapter) | free tier OK — `*.googleapis.com` is allow-listed, proxy handled automatically |
-| **Vercel** | `api/index.py` + `vercel.json` | serverless, 60 s/call, scales to zero |
-| **Render** | `render.yaml` | sleeps after 15 min; bot pings it every 8 min |
-| **Railway / Koyeb / Heroku-like** | `Procfile` | inject `$PORT` automatically |
-| **Fly.io / any Docker host** | `Dockerfile` | `docker run -p 7860:7860` |
+| Platform | Entry file | Card? | Free tier notes |
+|---|---|---|---|
+| **Hugging Face Spaces** | `hf_app.py` (Gradio SDK, ZeroGPU) | ❌ | always-on; account must be 30+ days old, e-mail verified; max 2 Spaces |
+| **Cloudflare Workers** | `cloudflare/worker.js` + `wrangler.toml` | ❌ | 100k req/day, global edge, never sleeps — **fastest & most reliable free worker** |
+| **Render** | `render.yaml` | ❌ | 750 h/month, sleeps after 15 min; bot pings it every 8 min |
+| **Vercel** | `api/index.py` + `vercel.json` | ❌ | serverless, 60 s/call, scales to zero |
+| **PythonAnywhere** | `wsgi.py` (a2wsgi adapter) | ❌ | `*.googleapis.com` allow-listed, proxy handled; renew every 3 months |
+| **Deno Deploy** | `deno_worker.ts` (re-uses CF worker) | ❌ | 1M req/month, edge, never sleeps |
+| **Railway / Koyeb / Heroku-like** | `Procfile` | varies | inject `$PORT` automatically |
+| **Fly.io / any Docker host / VPS** | `Dockerfile` | varies | `docker run -p 7860:7860` |
 
 Each worker exposes `GET /` (health) and `POST /translate`. Optional `WORKER_SECRET`
 (header `X-Worker-Key`) — set the **same value** on every worker and in the bot's `.env`.
 
-### 1a. Hugging Face Spaces (recommended)
+### 1a. Hugging Face Spaces — free **Gradio + ZeroGPU** (no card)
 
-1. <https://huggingface.co/new-space> → name it, **SDK: Docker**, hardware *CPU basic (free)*, Public.
-2. Push this repo to the Space (or upload `app.py`, `requirements.txt`, `Dockerfile`, `README.md`):
+1. <https://huggingface.co/new-space> → name it → **SDK: Gradio** → template **Blank** →
+   hardware **ZeroGPU (Free)** → Public → *Create Space*.
+   (Docker is greyed out / "Paid" — that's expected now; don't pick it.)
+2. Push this repo to the Space (or upload `app.py`, `hf_app.py`, `requirements.txt`, `README.md`):
    ```bash
    git remote add hf https://huggingface.co/spaces/<user>/<space>
-   git push hf main
+   git push hf main --force
    ```
+   The README front-matter already says `sdk: gradio` / `app_file: hf_app.py`.
 3. *(optional)* Settings → **Variables and secrets** → add secret `WORKER_SECRET`.
 4. Worker URL: `https://<user>-<space>.hf.space` → `/addworker` in Telegram.
+   Open the URL in a browser: you get a small Gradio test page; `/health` and
+   `/translate` are the API the bot uses.
 
-HF Spaces stay awake (no cold-start) — the bot's keep-alive ping keeps them from
-sleeping after 48 h of inactivity as well.
+Notes
+* ZeroGPU Spaces need at least one `@spaces.GPU` function to exist and a startup
+  report — `hf_app.py` does both. The probe is never called, so **0 s of GPU quota** is used.
+* If you get *"you can't host ZeroGPU Spaces yet"* your account is younger than 30 days /
+  e-mail not verified. Use Cloudflare or Render meanwhile.
+* If the Space shows `No @spaces.GPU function detected` → Settings → **Factory rebuild**.
+
+### 1a′. Cloudflare Workers (recommended — free, no card, never sleeps)
+
+```bash
+cd cloudflare
+npx wrangler login               # opens browser, free Cloudflare account is enough
+npx wrangler deploy              # → https://epub-translate-worker.<you>.workers.dev
+npx wrangler secret put WORKER_SECRET   # optional, same value as the bot
+```
+
+Or via dashboard: **Workers & Pages → Create → Import a repository** → pick this repo →
+root directory `cloudflare` → Deploy. Test: `curl https://…workers.dev/health`.
+
+Free plan: 100 000 requests/day, 10 ms CPU per request (network wait to Google is
+not counted) — plenty for several books a day.
 
 ### 1b. PythonAnywhere (free account works)
 
@@ -94,6 +133,12 @@ New **Web Service** → this repo → Render reads `render.yaml`
 (or set start command `uvicorn app:app --host 0.0.0.0 --port $PORT`).
 Free instances sleep; the bot wakes them with periodic pings (75 s ping timeout).
 
+### 1d′. Deno Deploy (free, no card)
+
+<https://dash.deno.com> → **New Project** → link this GitHub repo → entry point
+`deno_worker.ts` → Deploy. Set `WORKER_SECRET` under *Environment Variables* if used.
+Worker URL: `https://<project>.deno.dev`
+
 ### 1e. Railway / Koyeb / Fly / Docker
 
 * **Railway / Koyeb**: connect repo → they use `Procfile` (or the `Dockerfile`). Nothing else to set.
@@ -108,7 +153,7 @@ Free instances sleep; the bot wakes them with periodic pings (75 s ping timeout)
 
 ```bash
 curl https://<worker-url>/
-# {"status":"ok","platform":"huggingface","proxy":false,"uptime":12,...}
+# {"status":"ok","platform":"huggingface","proxy":false,"uptime":12,...}   (or "cloudflare", "render", …)
 curl -X POST https://<worker-url>/translate -H 'content-type: application/json' \
      -H 'X-Worker-Key: <secret>' -d '{"text_list":["Hello"],"lang":"hi"}'
 # {"success":true,"translated":["नमस्ते"]}
@@ -143,7 +188,7 @@ Then in Telegram: `/admin` → **Workers** → **Add worker** → paste each wor
 (HF, PythonAnywhere, Vercel, Render…). Or in one go:
 
 ```
-/addworker https://user-space.hf.space https://user.pythonanywhere.com https://proj.vercel.app
+/addworker https://user-space.hf.space https://epub-translate-worker.user.workers.dev https://proj.onrender.com https://proj.vercel.app https://user.pythonanywhere.com https://proj.deno.dev
 ```
 
 The bot load-balances by latency/load, auto-disables dead workers and pings them
@@ -194,14 +239,17 @@ and retried instead of being dropped. Typical: 14M-char novel ≈ 4–6 min with
 ## Repo layout
 
 ```
-app.py              worker (FastAPI) — identical on every platform
+app.py              worker (FastAPI) — identical on every Python platform
+hf_app.py           Hugging Face Gradio/ZeroGPU entry (mounts Gradio UI on top of app.py)
+cloudflare/         Cloudflare Worker (worker.js + wrangler.toml) — JS port of app.py
+deno_worker.ts      Deno Deploy entry (re-uses cloudflare/worker.js)
 api/index.py        Vercel serverless entry (re-exports app)
 wsgi.py             PythonAnywhere WSGI entry (a2wsgi)
-Dockerfile          Hugging Face / Fly / Koyeb / any Docker host
+Dockerfile          Fly / Koyeb / any Docker host / VPS
 Procfile            Railway / Koyeb / Heroku-style
 render.yaml         Render blueprint
 vercel.json         Vercel config
-requirements.txt    worker deps
+requirements.txt    worker deps (gradio only needed on HF)
 bot.py              master bot — Oracle VPS only
 requirements-bot.txt, epub-bot.service, oracle_setup.sh   bot deps / systemd / installer
 ```
