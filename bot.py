@@ -120,12 +120,33 @@ class Config:
 
     RAZORPAY_KEY_ID = _env("RAZORPAY_KEY_ID")
     RAZORPAY_KEY_SECRET = _env("RAZORPAY_KEY_SECRET")
-    PREMIUM_PRICE_INR = _env_int("PREMIUM_PRICE_INR", 100)
-    PREMIUM_DAYS = _env_int("PREMIUM_DAYS", 30)
 
+    # ── plans ──────────────────────────────────────────────────────────
     FREE_DAILY_LIMIT = _env_int("FREE_DAILY_LIMIT", 2)          # files / day
     FREE_MAX_FILE_MB = _env_int("FREE_MAX_FILE_MB", 20)
+
+    # ₹10 · 5 file credits that never expire
+    STARTER_PRICE_INR = _env_int("STARTER_PRICE_INR", 10)
+    STARTER_CREDITS = _env_int("STARTER_CREDITS", 5)
+    # ₹40 · 25 file credits that never expire (bulk discount)
+    BULK_PRICE_INR = _env_int("BULK_PRICE_INR", 40)
+    BULK_CREDITS = _env_int("BULK_CREDITS", 25)
+    # file-size cap when a credit is spent
+    CREDIT_MAX_FILE_MB = _env_int("CREDIT_MAX_FILE_MB", 50)
+
+    # ₹50 · 30 days · 5 files/day · 50 MB
+    BASIC_PRICE_INR = _env_int("BASIC_PRICE_INR", 50)
+    BASIC_DAYS = _env_int("BASIC_DAYS", 30)
+    BASIC_DAILY_LIMIT = _env_int("BASIC_DAILY_LIMIT", 5)
+    BASIC_MAX_FILE_MB = _env_int("BASIC_MAX_FILE_MB", 50)
+
+    # ₹100 · 30 days · unlimited · 200 MB   (env names kept for backwards compat)
+    PREMIUM_PRICE_INR = _env_int("PREMIUM_PRICE_INR", 100)
+    PREMIUM_DAYS = _env_int("PREMIUM_DAYS", 30)
     PREMIUM_MAX_FILE_MB = _env_int("PREMIUM_MAX_FILE_MB", 200)
+    # ₹250 · 90 days · unlimited · 200 MB   (3 months for the price of 2.5)
+    PREMIUM3_PRICE_INR = _env_int("PREMIUM3_PRICE_INR", 250)
+    PREMIUM3_DAYS = _env_int("PREMIUM3_DAYS", 90)
 
     MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2)
     # ── throughput tuning ──────────────────────────────────────────────
@@ -208,6 +229,94 @@ def today_str() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  PLANS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Two kinds of paid products:
+#   • "sub"    — time-limited subscription (daily_limit=0 → unlimited)
+#   • "credits" — a pack of file credits that NEVER expires
+#
+# Resolution order when a user sends a file (see resolve_access):
+#   admin → active subscription (within its daily limit) → credits → free tier
+# Credits are therefore only spent when the subscription is exhausted/missing.
+
+
+@dataclass(frozen=True)
+class Plan:
+    key: str
+    title: str
+    emoji: str
+    price: int              # INR
+    kind: str               # "sub" | "credits"
+    days: int = 0           # sub only
+    daily_limit: int = 0    # sub only, 0 = unlimited
+    credits: int = 0        # credits only
+    max_mb: int = 50
+    priority: int = 1       # queue priority (0 = highest)
+    tagline: str = ""
+
+    @property
+    def is_sub(self) -> bool:
+        return self.kind == "sub"
+
+    @property
+    def button(self) -> str:
+        return f"{self.emoji} {self.title} — ₹{self.price}"
+
+    def features(self) -> List[str]:
+        f: List[str] = []
+        if self.is_sub:
+            f.append(f"Valid {self.days} days")
+            f.append("Unlimited translations" if self.daily_limit == 0 else f"{self.daily_limit} files every day")
+        else:
+            f.append(f"{self.credits} file credits")
+            f.append("Never expires — use anytime")
+        f.append(f"Files up to {self.max_mb} MB")
+        if self.priority == 0:
+            f.append("Priority queue (skip the line)")
+        elif self.priority == 1:
+            f.append("Faster queue than Free")
+        return f
+
+
+PLANS: Dict[str, Plan] = {
+    p.key: p
+    for p in (
+        Plan(
+            key="starter", title="Starter Pack", emoji="🎟", kind="credits",
+            price=Config.STARTER_PRICE_INR, credits=Config.STARTER_CREDITS,
+            max_mb=Config.CREDIT_MAX_FILE_MB, priority=1,
+            tagline="Pay once, use whenever you like",
+        ),
+        Plan(
+            key="bulk", title="Bulk Pack", emoji="🎫", kind="credits",
+            price=Config.BULK_PRICE_INR, credits=Config.BULK_CREDITS,
+            max_mb=Config.CREDIT_MAX_FILE_MB, priority=1,
+            tagline="Best value credits — 20% cheaper per file",
+        ),
+        Plan(
+            key="basic", title="Basic", emoji="🔹", kind="sub",
+            price=Config.BASIC_PRICE_INR, days=Config.BASIC_DAYS,
+            daily_limit=Config.BASIC_DAILY_LIMIT, max_mb=Config.BASIC_MAX_FILE_MB, priority=1,
+            tagline="For regular readers",
+        ),
+        Plan(
+            key="premium", title="Premium", emoji="⭐", kind="sub",
+            price=Config.PREMIUM_PRICE_INR, days=Config.PREMIUM_DAYS,
+            daily_limit=0, max_mb=Config.PREMIUM_MAX_FILE_MB, priority=0,
+            tagline="Most popular — no limits at all",
+        ),
+        Plan(
+            key="premium3", title="Premium 3 Months", emoji="👑", kind="sub",
+            price=Config.PREMIUM3_PRICE_INR, days=Config.PREMIUM3_DAYS,
+            daily_limit=0, max_mb=Config.PREMIUM_MAX_FILE_MB, priority=0,
+            tagline="Save ₹50 vs monthly",
+        ),
+    )
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  DATABASE (SQLite, thread-safe, tiny synchronous ops)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -262,6 +371,21 @@ class Database:
                 );
                 """
             )
+            # ── migrations for DBs created before multi-plan support ──
+            self._add_column("users", "plan", "TEXT DEFAULT ''")          # active subscription key
+            self._add_column("users", "credits", "INTEGER DEFAULT 0")     # never-expiring file credits
+            self._add_column("payments", "plan", "TEXT DEFAULT ''")
+            self._add_column("payments", "units", "INTEGER DEFAULT 0")     # credits bought (credit packs)
+            # old rows with a live premium_until but no plan key → they bought the old Premium
+            self._con.execute(
+                "UPDATE users SET plan='premium' WHERE (plan='' OR plan IS NULL) AND premium_until>?",
+                (int(time.time()),),
+            )
+
+    def _add_column(self, table: str, col: str, decl: str) -> None:
+        cols = {r[1] for r in self._con.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            self._con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     # ── generic helpers ────────────────────────────────────────────────────
     def _exec(self, sql: str, params: tuple = ()) -> None:
@@ -294,28 +418,78 @@ class Database:
     def set_lang(self, uid: int, lang: str) -> None:
         self._exec("UPDATE users SET lang=? WHERE id=?", (lang, uid))
 
+    def _ensure_user(self, uid: int) -> None:
+        if self.get_user(uid) is None:
+            self._exec(
+                "INSERT INTO users(id,name,username,lang,joined) VALUES(?,?,?,?,?)",
+                (uid, "", "", Config.DEFAULT_LANG, int(time.time())),
+            )
+
+    # ── subscriptions ──────────────────────────────────────────────────────
+    def active_sub(self, uid: int) -> Optional[Plan]:
+        """The user's live subscription plan, or None."""
+        row = self.get_user(uid)
+        if not row or row["premium_until"] <= time.time():
+            return None
+        return PLANS.get(row["plan"] or "premium") or PLANS["premium"]
+
     def is_premium(self, uid: int) -> bool:
+        """True for admins and users on an *unlimited* subscription."""
         if Config.is_admin(uid):
             return True
-        row = self.get_user(uid)
-        return bool(row and row["premium_until"] > time.time())
+        p = self.active_sub(uid)
+        return bool(p and p.daily_limit == 0)
 
-    def add_premium(self, uid: int, days: int) -> int:
+    def add_subscription(self, uid: int, plan_key: str, days: int) -> int:
+        """Grant/extend a subscription.
+
+        Same plan → extend from current expiry.  Different plan → the higher tier
+        wins immediately; remaining days of the old plan are carried over so
+        nobody loses paid time when upgrading.
+        """
+        self._ensure_user(uid)
         row = self.get_user(uid)
-        base = max(int(time.time()), row["premium_until"] if row else 0)
+        now = int(time.time())
+        cur_until = row["premium_until"] or 0
+        cur_key = row["plan"] or ""
+        new_plan = PLANS.get(plan_key) or PLANS["premium"]
+        cur_plan = PLANS.get(cur_key) if cur_until > now else None
+        base = max(now, cur_until)
         until = base + days * 86400
-        if row is None:
-            self._exec(
-                "INSERT INTO users(id,name,username,lang,premium_until,joined) VALUES(?,?,?,?,?,?)",
-                (uid, "", "", Config.DEFAULT_LANG, until, int(time.time())),
-            )
+        if cur_plan and cur_plan.key != new_plan.key:
+            # keep whichever tier is "bigger" (unlimited > limited, then by price)
+            def rank(p: Plan) -> Tuple[int, int]:
+                return (1 if p.daily_limit == 0 else 0, p.price)
+            final_key = new_plan.key if rank(new_plan) >= rank(cur_plan) else cur_plan.key
         else:
-            self._exec("UPDATE users SET premium_until=? WHERE id=?", (until, uid))
+            final_key = new_plan.key
+        self._exec("UPDATE users SET premium_until=?, plan=? WHERE id=?", (until, final_key, uid))
         return until
 
-    def revoke_premium(self, uid: int) -> None:
-        self._exec("UPDATE users SET premium_until=0 WHERE id=?", (uid,))
+    # kept for old call-sites / admin command
+    def add_premium(self, uid: int, days: int) -> int:
+        return self.add_subscription(uid, "premium", days)
 
+    def revoke_premium(self, uid: int) -> None:
+        self._exec("UPDATE users SET premium_until=0, plan='' WHERE id=?", (uid,))
+
+    # ── credits ────────────────────────────────────────────────────────────
+    def credits(self, uid: int) -> int:
+        row = self.get_user(uid)
+        return int(row["credits"] or 0) if row else 0
+
+    def add_credits(self, uid: int, n: int) -> int:
+        self._ensure_user(uid)
+        self._exec("UPDATE users SET credits=MAX(0, credits+?) WHERE id=?", (n, uid))
+        return self.credits(uid)
+
+    def spend_credit(self, uid: int) -> bool:
+        """Atomically consume one credit. Returns False if none left."""
+        with self._lock, self._con:
+            cur = self._con.execute("UPDATE users SET credits=credits-1 WHERE id=? AND credits>0", (uid,))
+            return cur.rowcount > 0
+
+    # ── daily counters ─────────────────────────────────────────────────────
     def daily_used(self, uid: int) -> int:
         row = self.get_user(uid)
         today = today_str()
@@ -323,10 +497,12 @@ class Database:
             return 0
         return row["daily_used"]
 
-    def record_usage(self, uid: int) -> None:
+    def record_usage(self, uid: int, count_daily: bool = True) -> None:
+        """Bump total_files; also bump today's counter unless the file was paid
+        for with a credit (credits are not subject to daily limits)."""
         today = today_str()
         row = self.get_user(uid)
-        used = (row["daily_used"] if row and row["daily_date"] == today else 0) + 1
+        used = (row["daily_used"] if row and row["daily_date"] == today else 0) + (1 if count_daily else 0)
         self._exec(
             "UPDATE users SET daily_used=?, daily_date=?, total_files=total_files+1 WHERE id=?",
             (used, today, uid),
@@ -347,6 +523,7 @@ class Database:
         return {
             "users": self._one("SELECT COUNT(*) c FROM users")["c"],
             "premium": self._one("SELECT COUNT(*) c FROM users WHERE premium_until>?", (now,))["c"],
+            "credits_out": self._one("SELECT COALESCE(SUM(credits),0) c FROM users")["c"],
             "banned": self._one("SELECT COUNT(*) c FROM users WHERE banned=1")["c"],
             "today_users": self._one("SELECT COUNT(*) c FROM users WHERE joined>?", (now - 86400,))["c"],
             "jobs_total": self._one("SELECT COUNT(*) c FROM jobs")["c"],
@@ -377,10 +554,10 @@ class Database:
         self._exec("UPDATE workers SET enabled=? WHERE url=?", (1 if enabled else 0, url))
 
     # ── payments ───────────────────────────────────────────────────────────
-    def add_payment(self, link_id: str, uid: int, amount: int, days: int) -> None:
+    def add_payment(self, link_id: str, uid: int, amount: int, days: int, plan: str = "premium", units: int = 0) -> None:
         self._exec(
-            "INSERT OR REPLACE INTO payments(link_id,user_id,amount,days,status,created) VALUES(?,?,?,?,'created',?)",
-            (link_id, uid, amount, days, int(time.time())),
+            "INSERT OR REPLACE INTO payments(link_id,user_id,amount,days,plan,units,status,created) VALUES(?,?,?,?,?,?,'created',?)",
+            (link_id, uid, amount, days, plan, units, int(time.time())),
         )
 
     def get_payment(self, link_id: str) -> Optional[sqlite3.Row]:
@@ -1417,6 +1594,8 @@ class Job:
     ext: str = field(default=".epub", compare=False)
     cancelled: bool = field(default=False, compare=False)
     task: Optional[asyncio.Task] = field(default=None, compare=False)
+    credit: bool = field(default=False, compare=False)   # paid with a never-expiring credit
+    credit_settled: bool = field(default=False, compare=False)  # credit consumed for real (job done)
 
 
 class JobQueue:
@@ -1472,6 +1651,11 @@ class JobQueue:
         self.running.pop(job.id, None)
         if self.by_user.get(job.user_id) == job.id:
             self.by_user.pop(job.user_id, None)
+        # refund the pre-charged credit if the job did not finish successfully
+        if job.credit and not job.credit_settled:
+            job.credit_settled = True
+            db.add_credits(job.user_id, 1)
+            log.info("job %d: credit refunded to user %d", job.id, job.user_id)
         try:
             if job.file_path.parent.name.startswith("epub_"):
                 shutil.rmtree(job.file_path.parent, ignore_errors=True)
@@ -1566,7 +1750,8 @@ class JobQueue:
         except Exception:
             pass
         db.finish_job(job.id, "done", epub.segments, epub.chars, elapsed)
-        db.record_usage(job.user_id)
+        job.credit_settled = True  # keep the credit; don't refund in _cleanup
+        db.record_usage(job.user_id, count_daily=not job.credit)
         log.info("job %d done: user=%d file=%s %.1fs", job.id, job.user_id, job.file_name, elapsed)
 
 
@@ -1587,19 +1772,23 @@ class Payments:
     def enabled(self) -> bool:
         return self.client is not None
 
-    async def create_link(self, uid: int) -> Tuple[str, str]:
-        amount = Config.PREMIUM_PRICE_INR * 100
+    async def create_link(self, uid: int, plan: Plan) -> Tuple[str, str]:
+        desc = (
+            f"EPUB Translator {plan.title} ({plan.days} days)"
+            if plan.is_sub
+            else f"EPUB Translator {plan.title} ({plan.credits} credits)"
+        )
         data = {
-            "amount": amount,
+            "amount": plan.price * 100,
             "currency": "INR",
             "accept_partial": False,
-            "description": f"EPUB Translator Premium ({Config.PREMIUM_DAYS} days)",
+            "description": desc,
             "notify": {"sms": False, "email": False},
             "reminder_enable": False,
-            "notes": {"user_id": str(uid)},
+            "notes": {"user_id": str(uid), "plan": plan.key},
         }
         link = await asyncio.to_thread(self.client.payment_link.create, data)
-        db.add_payment(link["id"], uid, Config.PREMIUM_PRICE_INR, Config.PREMIUM_DAYS)
+        db.add_payment(link["id"], uid, plan.price, plan.days, plan.key, plan.credits)
         return link["id"], link["short_url"]
 
     async def verify(self, link_id: str) -> bool:
@@ -1618,7 +1807,8 @@ payments = Payments()
 # ═══════════════════════════════════════════════════════════════════════════
 
 BTN_LANG = "🌐 Language"
-BTN_PREMIUM = "⭐ Premium"
+BTN_PREMIUM = "💼 Plans"
+BTN_PREMIUM_OLD = "⭐ Premium"   # label from older keyboards still cached on users' phones
 BTN_STATUS = "📊 Status"
 BTN_HELP = "❓ Help"
 BTN_ADMIN = "🛠 Admin"
@@ -1690,14 +1880,93 @@ async def safe_edit(msg: Optional[Message], text: str, kb: Optional[InlineKeyboa
 
 
 def user_line(row: sqlite3.Row) -> str:
+    """One-line plan summary shown in /start, /status, /user."""
     uid = row["id"]
     if Config.is_admin(uid):
-        plan = "👑 Admin"
-    elif row["premium_until"] > time.time():
-        plan = f"⭐ Premium till {fmt_dt(row['premium_until'])}"
+        return "👑 Admin"
+    sub = db.active_sub(uid)
+    credits = db.credits(uid)
+    if sub:
+        line = f"{sub.emoji} {sub.title} till {fmt_dt(row['premium_until'])}"
+        if sub.daily_limit:
+            line += f" · {max(0, sub.daily_limit - db.daily_used(uid))}/{sub.daily_limit} left today"
     else:
-        plan = f"🆓 Free · {max(0, Config.FREE_DAILY_LIMIT - db.daily_used(uid))}/{Config.FREE_DAILY_LIMIT} left today"
-    return plan
+        line = f"🆓 Free · {max(0, Config.FREE_DAILY_LIMIT - db.daily_used(uid))}/{Config.FREE_DAILY_LIMIT} left today"
+    if credits:
+        line += f"\n🎟 Credits: <b>{credits}</b> (never expire)"
+    return line
+
+
+@dataclass
+class Access:
+    """What the user is allowed to do with the file they just sent."""
+    source: str          # "admin" | "sub" | "credit" | "free" | "blocked"
+    max_mb: int
+    priority: int
+    reason: str = ""     # user-facing text when blocked
+
+
+def resolve_access(uid: int) -> Access:
+    """Decide which entitlement pays for the next file.
+
+    Order: admin → active subscription with daily quota left → credits → free quota.
+    File-size is checked afterwards by the caller against `max_mb`.
+    """
+    if Config.is_admin(uid):
+        return Access("admin", Config.PREMIUM_MAX_FILE_MB, 0)
+    used = db.daily_used(uid)
+    sub = db.active_sub(uid)
+    if sub and (sub.daily_limit == 0 or used < sub.daily_limit):
+        return Access("sub", sub.max_mb, sub.priority)
+    if db.credits(uid) > 0:
+        return Access("credit", Config.CREDIT_MAX_FILE_MB, 1)
+    if sub is None and used < Config.FREE_DAILY_LIMIT:
+        return Access("free", Config.FREE_MAX_FILE_MB, 2)
+    if sub:
+        reason = (
+            f"⏳ Daily limit of your {sub.emoji} <b>{sub.title}</b> plan reached ({sub.daily_limit} files).\n"
+            "Come back tomorrow, or buy a 🎟 credit pack / upgrade to ⭐ Premium — /plans"
+        )
+    else:
+        reason = (
+            f"⏳ Daily free limit reached ({Config.FREE_DAILY_LIMIT} files).\n"
+            f"🎟 Get {Config.STARTER_CREDITS} credits for just ₹{Config.STARTER_PRICE_INR} (never expire) "
+            "or go unlimited with ⭐ Premium — /plans"
+        )
+    return Access("blocked", 0, 9, reason)
+
+
+def plans_kb(uid: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(p.button, callback_data=f"plan:{p.key}")] for p in PLANS.values()]
+    return InlineKeyboardMarkup(rows)
+
+
+def plans_text(row: sqlite3.Row) -> str:
+    lines = [
+        "💼 <b>Plans & Pricing</b>\n",
+        f"Your plan: {user_line(row)}\n",
+        f"🆓 <b>Free</b> — {Config.FREE_DAILY_LIMIT} files/day · up to {Config.FREE_MAX_FILE_MB} MB\n",
+    ]
+    for p in PLANS.values():
+        if p.is_sub:
+            limit = "unlimited" if p.daily_limit == 0 else f"{p.daily_limit} files/day"
+            lines.append(f"{p.emoji} <b>{p.title}</b> — ₹{p.price} · {p.days} days · {limit} · {p.max_mb} MB")
+        else:
+            lines.append(f"{p.emoji} <b>{p.title}</b> — ₹{p.price} · {p.credits} files · never expires · {p.max_mb} MB")
+        if p.tagline:
+            lines.append(f"    <i>{p.tagline}</i>")
+    lines.append("\n💡 Credits are used only after your daily quota is finished, so they are never wasted.")
+    lines.append("Tap a plan below to see details and pay.")
+    return "\n".join(lines)
+
+
+def plan_detail_text(p: Plan) -> str:
+    head = f"{p.emoji} <b>{p.title}</b> — ₹{p.price}"
+    if p.is_sub:
+        head += f" / {p.days} days"
+    body = "\n".join(f"• {x}" for x in p.features())
+    tag = f"\n<i>{p.tagline}</i>" if p.tagline else ""
+    return f"{head}{tag}\n\n{body}\n\nPay via the button, then tap <b>verify</b>. Activation is instant."
 
 
 # per-admin pending input (e.g. waiting for worker URL / broadcast text)
@@ -1796,9 +2065,12 @@ async def cmd_help(client: Client, message: Message) -> None:
         "• PDF: page layout, images — text is replaced in place (scanned PDFs not supported)\n"
         "• TXT/MD: line breaks and indentation\n\n"
         f"🆓 Free: {Config.FREE_DAILY_LIMIT} files/day, up to {Config.FREE_MAX_FILE_MB} MB\n"
-        f"⭐ Premium: unlimited, priority queue, up to {Config.PREMIUM_MAX_FILE_MB} MB\n\n"
+        f"🎟 Starter Pack ₹{Config.STARTER_PRICE_INR}: {Config.STARTER_CREDITS} files, never expire, up to {Config.CREDIT_MAX_FILE_MB} MB\n"
+        f"🔹 Basic ₹{Config.BASIC_PRICE_INR}: {Config.BASIC_DAILY_LIMIT} files/day for {Config.BASIC_DAYS} days, up to {Config.BASIC_MAX_FILE_MB} MB\n"
+        f"⭐ Premium ₹{Config.PREMIUM_PRICE_INR}: unlimited, priority queue, up to {Config.PREMIUM_MAX_FILE_MB} MB\n"
+        "→ all plans: /plans\n\n"
         "<b>Commands</b>\n"
-        "/start · /help · /lang · /status · /premium · /cancel\n\n"
+        "/start · /help · /lang · /status · /plans · /cancel\n\n"
         f"💬 Support: {html.escape(Config.SUPPORT_CONTACT)}",
         disable_web_page_preview=True,
     )
@@ -1846,34 +2118,75 @@ async def cmd_status(client: Client, message: Message) -> None:
     )
 
 
-# ── premium ────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command(["premium", "pay"]) | filters.regex(f"^{re.escape(BTN_PREMIUM)}$")))
+# ── plans / premium ────────────────────────────────────────────────────────
+@app.on_message(filters.private & (filters.command(["premium", "pay", "plans", "plan", "buy"]) | filters.regex(f"^({re.escape(BTN_PREMIUM)}|{re.escape(BTN_PREMIUM_OLD)})$")))
 async def cmd_premium(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    uid = message.from_user.id
-    if db.is_premium(uid):
-        return await message.reply_text(f"⭐ You already have Premium.\n{user_line(row)}")
+    await message.reply_text(plans_text(row), reply_markup=plans_kb(message.from_user.id), disable_web_page_preview=True)
+
+
+@app.on_callback_query(filters.regex(r"^plans$"))
+async def cb_plans_menu(client: Client, cq: CallbackQuery) -> None:
+    row = db.upsert_user(cq.from_user.id, cq.from_user.first_name or "", cq.from_user.username)
+    await cq.answer()
+    await safe_edit(cq.message, plans_text(row), plans_kb(cq.from_user.id))
+
+
+@app.on_callback_query(filters.regex(r"^plan:(\w+)$"))
+async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
+    plan = PLANS.get(cq.matches[0].group(1))
+    if not plan:
+        return await cq.answer("Unknown plan.", show_alert=True)
+    uid = cq.from_user.id
+    db.upsert_user(uid, cq.from_user.first_name or "", cq.from_user.username)
+    back = InlineKeyboardButton("« All plans", callback_data="plans")
+
+    # unlimited users don't need a smaller sub — but credit packs/extension are always allowed
+    cur = db.active_sub(uid)
+    if plan.is_sub and cur and cur.daily_limit == 0 and plan.daily_limit != 0:
+        return await cq.answer(f"You already have {cur.title} (unlimited) — no need for {plan.title}.", show_alert=True)
+
     if not payments.enabled:
-        return await message.reply_text(f"⭐ <b>Premium</b> — ₹{Config.PREMIUM_PRICE_INR}/{Config.PREMIUM_DAYS} days\n\nContact {html.escape(Config.SUPPORT_CONTACT)} to upgrade.")
+        await cq.answer()
+        return await safe_edit(
+            cq.message,
+            plan_detail_text(plan) + f"\n\n💬 Payments are handled manually — contact {html.escape(Config.SUPPORT_CONTACT)} to buy.",
+            InlineKeyboardMarkup([[back]]),
+        )
     try:
-        link_id, url = await payments.create_link(uid)
+        link_id, url = await payments.create_link(uid, plan)
     except Exception as e:  # noqa: BLE001
         log.error("payment link error: %s", e)
-        return await message.reply_text("⚠️ Payment service temporarily unavailable. Please try later.")
+        return await cq.answer("⚠️ Payment service temporarily unavailable. Please try later.", show_alert=True)
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"💳 Pay ₹{Config.PREMIUM_PRICE_INR}", url=url)],
+            [InlineKeyboardButton(f"💳 Pay ₹{plan.price}", url=url)],
             [InlineKeyboardButton("✅ I've paid — verify", callback_data=f"pay:{link_id}")],
+            [back],
         ]
     )
-    await message.reply_text(
-        f"⭐ <b>Premium — {Config.PREMIUM_DAYS} days</b>\n\n"
-        "• Unlimited translations\n• Priority queue\n"
-        f"• Files up to {Config.PREMIUM_MAX_FILE_MB} MB\n\n"
-        "Pay via the button, then tap <b>verify</b>. Activation is instant.",
-        reply_markup=kb,
+    await cq.answer()
+    await safe_edit(cq.message, plan_detail_text(plan), kb)
+
+
+def _activate_payment(p: sqlite3.Row) -> str:
+    """Grant whatever the paid row represents. Returns the user-facing success text."""
+    plan = PLANS.get(p["plan"] or "premium")
+    uid = p["user_id"]
+    if plan is None:  # plan removed from catalogue after purchase → honour as premium days
+        until = db.add_subscription(uid, "premium", p["days"] or Config.PREMIUM_DAYS)
+        return f"🎉 <b>Premium activated!</b>\nValid till <b>{fmt_dt(until)}</b>."
+    if plan.is_sub:
+        until = db.add_subscription(uid, plan.key, p["days"] or plan.days)
+        limit = "Enjoy unlimited translations." if plan.daily_limit == 0 else f"{plan.daily_limit} files every day, up to {plan.max_mb} MB."
+        return f"🎉 <b>{plan.emoji} {plan.title} activated!</b>\nValid till <b>{fmt_dt(until)}</b>. {limit}"
+    total = db.add_credits(uid, p["units"] or plan.credits)
+    return (
+        f"🎉 <b>{plan.emoji} {plan.title} activated!</b>\n"
+        f"+{p['units'] or plan.credits} credits → you now have <b>{total}</b>.\n"
+        "They never expire — send a file whenever you like."
     )
 
 
@@ -1889,17 +2202,21 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
         return await cq.answer("Payment service is not configured.", show_alert=True)
     # a callback query can only be answered ONCE — so verify first, answer after
     if await payments.verify(link_id):
-        # re-check: two quick taps must not grant premium twice
+        # re-check: two quick taps must not grant twice
         fresh = db.get_payment(link_id)
         if fresh is None or fresh["status"] == "paid":
             return await cq.answer("Already activated ✅", show_alert=True)
         db.mark_paid(link_id)
-        until = db.add_premium(p["user_id"], p["days"])
+        text = _activate_payment(p)
         await cq.answer("Payment verified ✅")
-        await safe_edit(cq.message, f"🎉 <b>Premium activated!</b>\nValid till <b>{fmt_dt(until)}</b>. Enjoy unlimited translations.")
+        await safe_edit(cq.message, text)
         if Config.OWNER_ID:
             try:
-                await client.send_message(Config.OWNER_ID, f"💰 New payment ₹{p['amount']} from <code>{p['user_id']}</code> (@{cq.from_user.username or '-'})")
+                plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
+                await client.send_message(
+                    Config.OWNER_ID,
+                    f"💰 New payment ₹{p['amount']} · {plan_name} from <code>{p['user_id']}</code> (@{cq.from_user.username or '-'})",
+                )
             except Exception:
                 pass
     else:
@@ -1970,18 +2287,18 @@ async def on_document(client: Client, message: Message) -> None:
     if not name.lower().endswith(ext):
         name += ext
 
-    premium = db.is_premium(uid)
-    max_mb = Config.PREMIUM_MAX_FILE_MB if premium else Config.FREE_MAX_FILE_MB
+    access = resolve_access(uid)
+    if access.source == "blocked":
+        return await message.reply_text(access.reason, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
     file_size = doc.file_size or 0
-    if file_size > max_mb * 1024 * 1024:
+    if file_size > access.max_mb * 1024 * 1024:
+        hint = ""
+        if access.source != "admin" and access.max_mb < Config.PREMIUM_MAX_FILE_MB:
+            hint = f"\n⭐ Premium allows files up to {Config.PREMIUM_MAX_FILE_MB} MB — /plans"
         return await message.reply_text(
-            f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{max_mb} MB</b>."
-            + ("" if premium else "\n⭐ Upgrade with /premium for bigger files.")
+            f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{access.max_mb} MB</b>." + hint
         )
-    if not premium and db.daily_used(uid) >= Config.FREE_DAILY_LIMIT:
-        return await message.reply_text(
-            f"⏳ Daily free limit reached ({Config.FREE_DAILY_LIMIT} files).\n⭐ Upgrade with /premium for unlimited access."
-        )
+    premium = access.priority == 0  # unlimited tier / admin → skips the queue
     if jobs.user_has_job(uid) or uid in downloading:
         return await message.reply_text("⚠️ You already have a file in progress. Use /cancel to stop it first.")
     if not pool.available() and not Config.DIRECT_FALLBACK and Config.DIRECT_CONCURRENCY <= 0:
@@ -2008,9 +2325,25 @@ async def on_document(client: Client, message: Message) -> None:
             await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
             return
 
+        # Re-resolve after the (slow) download: quota may have changed meanwhile.
+        access = resolve_access(uid)
+        if access.source == "blocked":
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            await safe_edit(status, access.reason)
+            return
+        # Credits are spent up-front (atomically) so two parallel uploads can't
+        # both ride on the same last credit; refunded if the job fails/cancels.
+        paid_with_credit = False
+        if access.source == "credit":
+            if not db.spend_credit(uid):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                await safe_edit(status, resolve_access(uid).reason or "⏳ No credits left.")
+                return
+            paid_with_credit = True
+
         job_id = db.add_job(uid, name, row["lang"])
         job = Job(
-            priority=0 if premium else 1,
+            priority=access.priority,
             created=time.time(),
             id=job_id,
             user_id=uid,
@@ -2020,6 +2353,7 @@ async def on_document(client: Client, message: Message) -> None:
             lang=row["lang"],
             status_msg=status,
             ext=ext,
+            credit=paid_with_credit,
         )
         await jobs.submit(job)
     except Exception as e:  # noqa: BLE001
@@ -2037,7 +2371,8 @@ async def on_document(client: Client, message: Message) -> None:
     await safe_edit(
         status,
         f"✅ <b>Queued</b> · position #{pos}\n📄 {html.escape(name)}\n🌐 → {lang_name(row['lang'])}"
-        + ("" if premium else "\n\n⭐ Premium users skip the queue — /premium"),
+        + (f"\n🎟 1 credit used · {db.credits(uid)} left" if paid_with_credit else "")
+        + ("" if premium else "\n\n⭐ Premium users skip the queue — /plans"),
         cancel_kb(job_id),
     )
 
@@ -2058,7 +2393,9 @@ def admin_text() -> str:
         f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queued_count()}\n\n"
         "<b>Commands</b>\n"
         "<code>/addworker URL</code> · <code>/delworker URL</code>\n"
-        "<code>/addpremium USER_ID [days]</code> · <code>/revoke USER_ID</code>\n"
+        "<code>/addpremium USER_ID [days]</code> · <code>/addplan USER_ID PLAN [days]</code>\n"
+        "<code>/addcredits USER_ID N</code> · <code>/revoke USER_ID</code>\n"
+        f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}\n"
         "<code>/ban USER_ID</code> · <code>/unban USER_ID</code> · <code>/user USER_ID</code>\n"
         "<code>/broadcast TEXT</code> (or reply to a message)"
     )
@@ -2102,7 +2439,8 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
             f"⭐ Premium: {s['premium']} · 🚫 Banned: {s['banned']}\n\n"
             f"📚 Jobs: {s['jobs_total']} · ✅ {s['jobs_done']} · ❌ {s['jobs_failed']}\n"
             f"🔤 Characters translated: {s['chars']:,}\n\n"
-            f"💰 Payments: {s['payments']} · Revenue: ₹{s['revenue']:,}",
+            f"💰 Payments: {s['payments']} · Revenue: ₹{s['revenue']:,}\n"
+            f"🎟 Unused credits (all users): {s['credits_out']}",
             back,
         )
     elif action == "queue":
@@ -2184,6 +2522,50 @@ async def cmd_addpremium(client: Client, message: Message) -> None:
         pass
 
 
+@app.on_message(admin_filter & filters.command("addplan"))
+async def cmd_addplan(client: Client, message: Message) -> None:
+    """/addplan USER_ID PLAN_KEY [days|credits] — grant any catalogue plan manually."""
+    try:
+        uid = int(message.command[1])
+        plan = PLANS[message.command[2].lower()]
+        amount = int(message.command[3]) if len(message.command) > 3 else 0
+    except (IndexError, ValueError, KeyError):
+        return await message.reply_text(
+            "Usage: <code>/addplan USER_ID PLAN [days|credits]</code>\n"
+            f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}"
+        )
+    if plan.is_sub:
+        until = db.add_subscription(uid, plan.key, amount or plan.days)
+        await message.reply_text(f"{plan.emoji} {plan.title} for <code>{uid}</code> till {fmt_dt(until)}.")
+        note = f"🎉 <b>{plan.emoji} {plan.title} activated!</b> Valid till <b>{fmt_dt(until)}</b>."
+    else:
+        n = amount or plan.credits
+        total = db.add_credits(uid, n)
+        await message.reply_text(f"{plan.emoji} +{n} credits for <code>{uid}</code> → {total} total.")
+        note = f"🎉 <b>{plan.emoji} {plan.title} activated!</b> +{n} credits → you now have <b>{total}</b>. They never expire."
+    try:
+        await client.send_message(uid, note)
+    except Exception:
+        pass
+
+
+@app.on_message(admin_filter & filters.command("addcredits"))
+async def cmd_addcredits(client: Client, message: Message) -> None:
+    """/addcredits USER_ID N — N may be negative to deduct."""
+    try:
+        uid = int(message.command[1])
+        n = int(message.command[2])
+    except (IndexError, ValueError):
+        return await message.reply_text("Usage: <code>/addcredits USER_ID N</code>")
+    total = db.add_credits(uid, n)
+    await message.reply_text(f"🎟 Credits for <code>{uid}</code>: {n:+d} → <b>{total}</b>.")
+    if n > 0:
+        try:
+            await client.send_message(uid, f"🎟 You received <b>{n}</b> file credits → total <b>{total}</b>. They never expire.")
+        except Exception:
+            pass
+
+
 @app.on_message(admin_filter & filters.command("revoke"))
 async def cmd_revoke(client: Client, message: Message) -> None:
     try:
@@ -2191,7 +2573,7 @@ async def cmd_revoke(client: Client, message: Message) -> None:
     except (IndexError, ValueError):
         return await message.reply_text("Usage: <code>/revoke USER_ID</code>")
     db.revoke_premium(uid)
-    await message.reply_text(f"Premium revoked for <code>{uid}</code>.")
+    await message.reply_text(f"Subscription revoked for <code>{uid}</code> (credits untouched — use /addcredits to adjust).")
 
 
 @app.on_message(admin_filter & filters.command(["ban", "unban"]))
@@ -2273,13 +2655,13 @@ async def cmd_cancel_input(client: Client, message: Message) -> None:
 
 
 # admin pending-input consumer (must be registered after commands; group=1)
-@app.on_message(admin_filter & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "cancel", "admin", "cancel_input"]), group=1)
+@app.on_message(admin_filter & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "admin", "cancel_input"]), group=1)
 async def on_admin_input(client: Client, message: Message) -> None:
     mode = pending_input.get(message.from_user.id)
     if not mode:
         return
     text = message.text or ""
-    if text in (BTN_LANG, BTN_PREMIUM, BTN_STATUS, BTN_HELP, BTN_ADMIN):
+    if text in (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN):
         return
     if text.startswith("/"):
         # any other command (/addworker, /ban, …) was already handled in group 0;
@@ -2305,9 +2687,9 @@ async def on_admin_input(client: Client, message: Message) -> None:
 
 
 # ── fallback for random text ───────────────────────────────────────────────
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "cancel"]), group=2)
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel"]), group=2)
 async def on_text(client: Client, message: Message) -> None:
-    if message.text in (BTN_LANG, BTN_PREMIUM, BTN_STATUS, BTN_HELP, BTN_ADMIN) or message.text.startswith("/"):
+    if message.text in (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN) or message.text.startswith("/"):
         return
     if message.from_user and Config.is_admin(message.from_user.id) and message.from_user.id in pending_input:
         return
