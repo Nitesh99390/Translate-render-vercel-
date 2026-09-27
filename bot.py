@@ -86,7 +86,17 @@ except Exception:  # pragma: no cover
 
 
 def _env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+    # systemd's EnvironmentFile (and some dashboards) keep inline "# comments"
+    # as part of the value — e.g. DIRECT_FALLBACK="true       # use Google …".
+    # Strip them so booleans / ints parse and don't silently fall back to defaults.
+    val = os.environ.get(key, default)
+    if "#" in val:
+        head = val.split("#", 1)[0]
+        # only treat it as a comment when preceded by whitespace (or the whole
+        # value is a comment); "#channel"-style tokens must stay intact
+        if not head.strip() or head != head.rstrip():
+            val = head
+    return val.strip().strip('"').strip("'")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -641,9 +651,14 @@ class Translator:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
             ) as r:
+                if r.status == 401:
+                    log.warning("worker %s rejected our key — WORKER_SECRET mismatch?", w.url)
+                    raise TranslationError("HTTP 401 (WORKER_SECRET mismatch)")
                 if r.status != 200:
                     raise TranslationError(f"HTTP {r.status}")
                 data = await r.json(content_type=None)
+            if not isinstance(data, dict):
+                raise TranslationError("bad worker response")
             out = data.get("translated") if data.get("success") else None
             if not isinstance(out, list) or len(out) != len(texts):
                 raise TranslationError(data.get("error") or "bad worker response")
@@ -1017,12 +1032,20 @@ def detect_format(file_name: str, mime: Optional[str]) -> Optional[str]:
 
 
 def _decode_text(raw: bytes) -> str:
-    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+    # UTF-16 must only be tried when there is a BOM: without one, almost any
+    # byte string "decodes" as UTF-16 into CJK garbage (e.g. a cp1252 file with
+    # a single accented letter) and the whole book would be destroyed.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for enc in ("utf-8-sig", "cp1252"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+    return raw.decode("latin-1")
 
 
 class BaseDocTranslator:
@@ -1049,22 +1072,23 @@ class TxtTranslator(BaseDocTranslator):
 
     async def translate(self, src: Path, dst: Path, progress=None) -> None:
         text = _decode_text(await asyncio.to_thread(src.read_bytes))
+        # Normalise line endings first, remember the original style and put it
+        # back at the end.  (Splitting on "\n" while keeping the "\r" and then
+        # joining with "\r\n" used to produce "\r\r\n" on every untouched line.)
         nl = "\r\n" if "\r\n" in text else "\n"
-        lines = text.split("\n")
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         idx: List[int] = []
         texts: List[str] = []
         for i, line in enumerate(lines):
-            core = line.strip("\r")
-            m = _ws_re.match(core)
-            body = m.group(2) if m else core
+            m = _ws_re.match(line)
+            body = m.group(2) if m else line
             if body and any(ch.isalpha() for ch in body):
                 idx.append(i)
                 texts.append(body)
         self._count(texts, "File")
         out = await self.tr.translate_many(texts, progress)
         for i, t in zip(idx, out):
-            core = lines[i].strip("\r")
-            m = _ws_re.match(core)
+            m = _ws_re.match(lines[i])
             lead, trail = (m.group(1), m.group(3)) if m else ("", "")
             lines[i] = f"{lead}{t}{trail}"
         await asyncio.to_thread(dst.write_bytes, nl.join(lines).encode("utf-8"))
@@ -1119,6 +1143,15 @@ class DocxTranslator(BaseDocTranslator):
         from lxml import etree as ET
 
         W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        P_TAG = f"{W}p"
+
+        def _owner_p(el):
+            """Nearest enclosing <w:p> of an element."""
+            el = el.getparent()
+            while el is not None and el.tag != P_TAG:
+                el = el.getparent()
+            return el
+
         parsed = []  # (name, tree, groups)  groups: list of list[Element w:t]
         texts: List[str] = []
         with zipfile.ZipFile(src) as z:
@@ -1128,16 +1161,19 @@ class DocxTranslator(BaseDocTranslator):
                     continue
                 tree = ET.fromstring(z.read(n))
                 groups: List[List] = []
-                for p in tree.iter(f"{W}p"):
-                    runs = [t for t in p.iter(f"{W}t") if t.text]
-                    if not runs:
-                        continue
-                    # split a paragraph into groups at tabs/breaks so layout survives
+                for p in tree.iter(P_TAG):
+                    # split a paragraph into groups at tabs/breaks so layout survives.
+                    # Paragraphs can be nested (text boxes, SmartArt, alt-content):
+                    # only take runs whose *nearest* <w:p> is this one, otherwise
+                    # the inner runs would be collected twice and written twice.
                     group: List = []
                     for r in p.iter():
-                        if r.tag == f"{W}t" and r.text:
-                            group.append(r)
-                        elif r.tag in (f"{W}tab", f"{W}br", f"{W}cr") and group:
+                        if r is p:
+                            continue
+                        if r.tag == f"{W}t":
+                            if r.text and _owner_p(r) is p:
+                                group.append(r)
+                        elif r.tag in (f"{W}tab", f"{W}br", f"{W}cr") and group and _owner_p(r) is p:
                             groups.append(group)
                             group = []
                     if group:
@@ -1274,7 +1310,7 @@ class PdfTranslator(BaseDocTranslator):
                     color = s.get("color", 0)
                     bold = bold or bool(s.get("flags", 0) & 16)
             # de-hyphenate line breaks ("transla-\ntion" → "translation")
-            if parts and parts[-1].endswith("-") and ltxt[:1].islower():
+            if parts and parts[-1].endswith("-") and ltxt.strip()[:1].islower():
                 parts[-1] = parts[-1][:-1] + ltxt.strip()
             else:
                 parts.append(ltxt.strip())
@@ -1456,6 +1492,7 @@ class JobQueue:
                 db.finish_job(job.id, "cancelled")
                 self._cleanup(job)
                 self.queue.task_done()
+                await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
                 continue
             self.running[job.id] = job
             job.task = asyncio.create_task(self._process(app, job))
@@ -1659,7 +1696,7 @@ def user_line(row: sqlite3.Row) -> str:
     elif row["premium_until"] > time.time():
         plan = f"⭐ Premium till {fmt_dt(row['premium_until'])}"
     else:
-        plan = f"🆓 Free · {Config.FREE_DAILY_LIMIT - db.daily_used(uid)}/{Config.FREE_DAILY_LIMIT} left today"
+        plan = f"🆓 Free · {max(0, Config.FREE_DAILY_LIMIT - db.daily_used(uid))}/{Config.FREE_DAILY_LIMIT} left today"
     return plan
 
 
@@ -1853,7 +1890,8 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
     # a callback query can only be answered ONCE — so verify first, answer after
     if await payments.verify(link_id):
         # re-check: two quick taps must not grant premium twice
-        if (db.get_payment(link_id) or {})["status"] == "paid":
+        fresh = db.get_payment(link_id)
+        if fresh is None or fresh["status"] == "paid":
             return await cq.answer("Already activated ✅", show_alert=True)
         db.mark_paid(link_id)
         until = db.add_premium(p["user_id"], p["days"])
@@ -1934,9 +1972,10 @@ async def on_document(client: Client, message: Message) -> None:
 
     premium = db.is_premium(uid)
     max_mb = Config.PREMIUM_MAX_FILE_MB if premium else Config.FREE_MAX_FILE_MB
-    if doc.file_size > max_mb * 1024 * 1024:
+    file_size = doc.file_size or 0
+    if file_size > max_mb * 1024 * 1024:
         return await message.reply_text(
-            f"⚠️ File too large ({doc.file_size / 1048576:.1f} MB). Limit for your plan: <b>{max_mb} MB</b>."
+            f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{max_mb} MB</b>."
             + ("" if premium else "\n⭐ Upgrade with /premium for bigger files.")
         )
     if not premium and db.daily_used(uid) >= Config.FREE_DAILY_LIMIT:
@@ -1951,37 +1990,49 @@ async def on_document(client: Client, message: Message) -> None:
     # reserve the user's slot *before* the (slow) download so two files sent
     # back-to-back cannot both slip past the "one job per user" check
     downloading.add(uid)
-    status = await message.reply_text("📥 <b>Downloading…</b>")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="epub_", dir=Config.DATA_DIR))
-    safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or f"document{ext}"
-    if not safe_name.lower().endswith(ext):
-        safe_name += ext
+    status: Optional[Message] = None
+    tmp_dir: Optional[Path] = None
     try:
-        path = await message.download(file_name=str(tmp_dir / safe_name))
-    except Exception as e:  # noqa: BLE001
-        log.warning("download failed for %s: %s", uid, e)
-        path = None
-    if not path or not _sniff_ok(Path(path), ext):
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        downloading.discard(uid)
-        await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
-        return
+        status = await message.reply_text("📥 <b>Downloading…</b>")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="epub_", dir=Config.DATA_DIR))
+        safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or f"document{ext}"
+        if not safe_name.lower().endswith(ext):
+            safe_name += ext
+        try:
+            path = await message.download(file_name=str(tmp_dir / safe_name))
+        except Exception as e:  # noqa: BLE001
+            log.warning("download failed for %s: %s", uid, e)
+            path = None
+        if not path or not _sniff_ok(Path(path), ext):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
+            return
 
-    job_id = db.add_job(uid, name, row["lang"])
-    job = Job(
-        priority=0 if premium else 1,
-        created=time.time(),
-        id=job_id,
-        user_id=uid,
-        chat_id=message.chat.id,
-        file_path=Path(path),
-        file_name=name,
-        lang=row["lang"],
-        status_msg=status,
-        ext=ext,
-    )
-    await jobs.submit(job)
-    downloading.discard(uid)
+        job_id = db.add_job(uid, name, row["lang"])
+        job = Job(
+            priority=0 if premium else 1,
+            created=time.time(),
+            id=job_id,
+            user_id=uid,
+            chat_id=message.chat.id,
+            file_path=Path(path),
+            file_name=name,
+            lang=row["lang"],
+            status_msg=status,
+            ext=ext,
+        )
+        await jobs.submit(job)
+    except Exception as e:  # noqa: BLE001
+        # never leave the user's slot reserved forever if anything above blew up
+        # (previously an unexpected error here meant "You already have a file in
+        # progress" until the bot was restarted)
+        log.exception("on_document failed for %s: %s", uid, e)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(status, "❌ Something went wrong while receiving the file. Please try again.")
+        return
+    finally:
+        downloading.discard(uid)
     pos = jobs.position(job_id)
     await safe_edit(
         status,
@@ -2024,7 +2075,7 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
         return await cq.answer("Admins only.", show_alert=True)
     action = cq.matches[0].group(1)
     back = InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="adm:menu")]])
-    toast, alert = "", False
+    toast, alert, answered = "", False, False
     if action == "menu":
         await safe_edit(cq.message, admin_text(), admin_kb())
     elif action == "close":
@@ -2032,7 +2083,13 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
     elif action == "workers":
         await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n" + pool.summary(), workers_kb())
     elif action == "health":
-        toast = "Workers pinged"
+        # answer *before* pinging: a ping may take up to 75 s and Telegram only
+        # accepts a callback answer for ~15 s (otherwise the button spins forever)
+        answered = True
+        try:
+            await cq.answer("Pinging workers…")
+        except Exception:
+            pass
         if jobs.session:
             await pool.health_check(jobs.session)
         await safe_edit(cq.message, "🖥 <b>Workers</b> (fresh check)\n\n" + pool.summary(), workers_kb())
@@ -2064,6 +2121,8 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
     elif action == "bcast":
         pending_input[cq.from_user.id] = "broadcast"
         await safe_edit(cq.message, "📣 Send the broadcast message now (text/photo). Send /cancel_input to abort.", back)
+    if answered:
+        return
     try:
         await cq.answer(toast, show_alert=alert)
     except Exception:

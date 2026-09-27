@@ -73,8 +73,9 @@ Each worker exposes `GET /` (health) and `POST /translate`. Optional `WORKER_SEC
    The README front-matter already says `sdk: gradio` / `app_file: hf_app.py`.
 3. *(optional)* Settings → **Variables and secrets** → add secret `WORKER_SECRET`.
 4. Worker URL: `https://<user>-<space>.hf.space` → `/addworker` in Telegram.
-   Open the URL in a browser: you get a small Gradio test page; `/health` and
-   `/translate` are the API the bot uses.
+   Open the URL in a browser: you are redirected to a small Gradio test page at
+   `/ui`; `/` (JSON for non-browser clients), `/health` and `/translate` are the
+   API the bot uses.
 
 Notes
 * ZeroGPU Spaces need at least one `@spaces.GPU` function to exist and a startup

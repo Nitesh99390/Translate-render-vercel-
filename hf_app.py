@@ -69,8 +69,12 @@ def _zerogpu_startup_report() -> None:
 # ── FastAPI worker (unchanged) + Gradio UI ────────────────────────────────────
 import gradio as gr  # noqa: E402
 import uvicorn  # noqa: E402
+from fastapi import Request  # noqa: E402
+from fastapi.responses import RedirectResponse  # noqa: E402
 
 from app import PLATFORM, WORKER_SECRET, _google, _health_payload, app as api  # noqa: E402
+
+UI_PATH = "/ui"
 
 LANGS = {
     "Hindi": "hi", "English": "en", "Bengali": "bn", "Tamil": "ta", "Telugu": "te",
@@ -114,10 +118,28 @@ with gr.Blocks(title="EPUB Translator Worker") as demo:
         st = gr.Code(language="json", value=_status)
         gr.Button("Refresh").click(_status, outputs=st)
 
-# API routes are already registered on `api` (imported above) so they take
-# precedence; the Gradio UI only receives paths the API does not handle.
-# ssr_mode=False: Gradio's SSR proxy breaks for apps mounted at "/" on Spaces.
-app = gr.mount_gradio_app(api, demo, path="/", ssr_mode=False)
+# `app.py` already answers `GET /` with the health JSON, so a Gradio app
+# mounted at "/" would never be reachable (the API route wins).  Mount the UI
+# at /ui instead and make `/` content-negotiate: browsers (Accept: text/html)
+# are redirected to the UI, the bot / curl / HF health probes keep getting the
+# plain JSON they expect.
+api.router.routes = [
+    r
+    for r in api.router.routes
+    if not (getattr(r, "path", None) == "/" and "GET" in (getattr(r, "methods", None) or set()))
+]
+
+
+@api.get("/")
+async def root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and "application/json" not in accept.split(",")[0]:
+        return RedirectResponse(UI_PATH, status_code=307)
+    return _health_payload()
+
+
+# ssr_mode=False: Gradio's SSR proxy breaks for mounted apps on Spaces.
+app = gr.mount_gradio_app(api, demo, path=UI_PATH, ssr_mode=False)
 
 
 def _port() -> int:
