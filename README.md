@@ -201,13 +201,34 @@ every `WORKER_PING_INTERVAL` seconds to keep sleepy free tiers awake.
 
 | User | Admin |
 |---|---|
-| Minimal keyboard: Language · Plans · Status · Help | Inline panel: Workers · Stats · Queue · Broadcast |
-| 20 languages, live progress bar + ETA, cancel button | Add / pause / remove workers, health check |
+| Persistent keyboard: Language · Output · Plans · Status · Help · Cancel | Inline panel: Workers · Stats · Queue · Broadcast · Health check |
+| 20 languages, live progress bar + ETA, cancel button | Add / pause / remove workers (stable ids), refresh & back buttons everywhere |
 | Free daily limit, 5 paid plans (Razorpay auto-verify) | `/addpremium /addplan /addcredits /revoke /ban /unban /user /broadcast` |
-| Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub |
-| Formats: EPUB, PDF (layout kept, Noto fonts auto-downloaded), DOCX, TXT/MD, HTML | Output is returned in the same format |
+| Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub (public **or** private channel) |
+| Formats: EPUB, PDF (layout kept, Noto fonts auto-downloaded), DOCX, TXT/MD, HTML | Output format & split size selectable per file or as defaults |
 
 All settings via environment variables — see `.env.example`.
+
+### Robustness (bot.py)
+
+* **Every handler is wrapped** (`@guarded`): an unexpected exception is logged and the
+  user gets *"Something went wrong… try again"* instead of a button that spins forever.
+* `safe_reply / safe_edit / safe_answer / safe_delete / safe_send` never raise — deleted
+  messages, expired callback queries, flood-waits and users who blocked the bot are all handled.
+* Reply-keyboard taps are matched **after Unicode normalisation** (`⚙️` vs `⚙`, stray spaces),
+  so old cached keyboards keep working on every client. Non-admins tapping a cached
+  **🛠 Admin** button get a proper answer; unknown `/commands`, photos and stickers too.
+* Double-tap / timer race on **▶️ Start** can no longer queue the same file twice or delete
+  the file of a live job; the options panel extends its deadline while you type a custom size
+  and always auto-starts eventually (no more stuck "file in progress").
+* A user waiting for a custom split size can still send a new document (was silently ignored).
+* `/ban` also discards the user's waiting file; banned / cancelled users are re-checked
+  after a slow download.
+* Payment **verify** is serialised per link (no double activation); Razorpay link creation
+  answers the callback first so the button never times out.
+* On boot: stale `epub_*` temp dirs are removed and jobs left `queued/running` by a crash
+  are marked failed; on shutdown, users with waiting/queued files are told to resend.
+* Telegram **`/` command menu** is registered automatically (richer list for admins).
 
 ## Plans
 
