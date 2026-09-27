@@ -1,0 +1,11 @@
+bot.py
+requirements-bot.txt
+epub-bot.service
+Dockerfile
+.dockerignore
+wsgi.py
+Procfile
+render.yaml
+data/
+*.session*
+*.log

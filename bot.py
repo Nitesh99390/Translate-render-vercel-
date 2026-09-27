@@ -2,7 +2,8 @@
 """
 EPUB Translator Bot — Master (single file)
 ==========================================
-Run this on the Oracle VM.  Translation workers (app.py) run on Render / Vercel.
+Run this on the Oracle VPS.  Translation workers (app.py) run on Hugging Face /
+PythonAnywhere / Vercel / Render / Railway / Koyeb — any host, same file.
 
 Highlights
 ----------
@@ -512,7 +513,8 @@ class WorkerPool:
     async def _ping(self, session: aiohttp.ClientSession, w: Worker) -> None:
         t0 = time.monotonic()
         try:
-            # Render free instances need up to ~60 s to wake from sleep
+            # Render free instances need up to ~60 s to wake from sleep; HF Spaces
+            # that were paused (48 h idle) can take a bit longer on the first hit
             async with session.get(f"{w.url}/", timeout=aiohttp.ClientTimeout(total=75)) as r:
                 ok = r.status == 200
         except Exception:
@@ -2076,7 +2078,7 @@ async def cb_workers(client: Client, cq: CallbackQuery) -> None:
     urls = list(pool.workers)
     if action == "add":
         pending_input[cq.from_user.id] = "add_worker"
-        await safe_edit(cq.message, "➕ Send the worker URL (e.g. <code>https://xyz.onrender.com</code>).\nSend /cancel_input to abort.")
+        await safe_edit(cq.message, "➕ Send the worker URL, e.g.\n<code>https://user-space.hf.space</code>\n<code>https://user.pythonanywhere.com</code>\n<code>https://proj.vercel.app</code>\n<code>https://xyz.onrender.com</code>\nSend /cancel_input to abort.")
         return await cq.answer()
     if idx is None or int(idx) >= len(urls):
         return await cq.answer("Worker not found.", show_alert=True)
@@ -2093,7 +2095,7 @@ async def cb_workers(client: Client, cq: CallbackQuery) -> None:
 async def cmd_addworker(client: Client, message: Message) -> None:
     pending_input.pop(message.from_user.id, None)
     if len(message.command) < 2:
-        return await message.reply_text("Usage: <code>/addworker https://xyz.onrender.com</code>")
+        return await message.reply_text("Usage: <code>/addworker https://user-space.hf.space [more URLs…]</code>")
     added = [u for u in message.command[1:] if pool.add(u)]
     if jobs.session and added:
         await pool.health_check(jobs.session)
@@ -2262,7 +2264,7 @@ async def on_text(client: Client, message: Message) -> None:
 
 
 async def keep_alive_loop() -> None:
-    """Ping workers to keep Render free instances awake and refresh health."""
+    """Ping workers to keep sleepy free tiers (Render, HF Spaces) awake and refresh health."""
     await asyncio.sleep(5)
     while True:
         try:

@@ -2,16 +2,31 @@
 EPUB Translator — Worker node
 =============================
 Stateless FastAPI service that translates a batch of strings.
-Deploy on Render (web service) or Vercel (serverless) — same file works on both.
+
+The SAME file runs everywhere — no platform-specific code paths:
+
+  Platform          Entry point                         Notes
+  ─────────────────────────────────────────────────────────────────────────────
+  Render            render.yaml  → uvicorn app:app      free plan sleeps, bot pings it
+  Vercel            vercel.json  → app.py (ASGI)        serverless, 60 s max per call
+  Hugging Face      Dockerfile   → uvicorn :7860         Docker Space, always-on
+  PythonAnywhere    wsgi.py      → a2wsgi(app)          WSGI only, outbound via proxy
+  Railway / Koyeb / Fly / Heroku-like   Procfile        `web: uvicorn app:app ...`
+  Any VPS / Docker  python app.py  or  docker run
 
 Endpoints
   GET  /            health check (used by the master for keep-alive & latency)
+  GET  /health      same as / (some platforms expect this path)
   POST /translate   {"text_list": [...], "lang": "hi"}  ->  {"success": true, "translated": [...]}
 
 Optional env
   WORKER_SECRET   if set, master must send header  X-Worker-Key: <secret>
   MAX_ITEMS       max strings per request (default 400)
   MAX_CHARS       max total characters per request (default 30000)
+  PORT            listen port when run directly (default 8000; HF uses 7860)
+  HTTPS_PROXY / HTTP_PROXY / https_proxy
+                  honoured automatically (PythonAnywhere free accounts route
+                  outbound traffic through proxy.server:3128)
   (the master sends ~150 items / ~9000 chars per batch by default; keep
    these limits above the master's BATCH_MAX_ITEMS / BATCH_MAX_CHARS)
 """
@@ -34,6 +49,42 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
+
+def _detect_platform() -> str:
+    """Best-effort name of the hosting platform (informational only)."""
+    env = os.environ
+    if env.get("VERCEL") or env.get("VERCEL_ENV"):
+        return "vercel"
+    if env.get("RENDER") or env.get("RENDER_SERVICE_ID"):
+        return "render"
+    if env.get("SPACE_ID") or env.get("SPACE_HOST"):
+        return "huggingface"
+    if env.get("PYTHONANYWHERE_DOMAIN") or env.get("PYTHONANYWHERE_SITE"):
+        return "pythonanywhere"
+    if env.get("RAILWAY_ENVIRONMENT") or env.get("RAILWAY_PROJECT_ID"):
+        return "railway"
+    if env.get("KOYEB_APP_NAME") or env.get("KOYEB_SERVICE_NAME"):
+        return "koyeb"
+    if env.get("FLY_APP_NAME"):
+        return "fly"
+    if env.get("DYNO"):
+        return "heroku"
+    return "generic"
+
+
+PLATFORM = _detect_platform()
+
+# Outbound proxy — PythonAnywhere free tier only allows internet access through
+# proxy.server:3128 and sets these variables for every process. aiohttp needs
+# trust_env=True to pick them up; on other platforms they are simply unset.
+_PROXY = (
+    os.environ.get("HTTPS_PROXY")
+    or os.environ.get("https_proxy")
+    or os.environ.get("HTTP_PROXY")
+    or os.environ.get("http_proxy")
+    or None
+)
+
 _started = time.time()
 _stats = {"requests": 0, "strings": 0, "errors": 0}
 _session: Optional[aiohttp.ClientSession] = None
@@ -46,7 +97,7 @@ async def _lifespan(_: FastAPI):
         await _session.close()
 
 
-app = FastAPI(title="EPUB Translator Worker", version="2.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="EPUB Translator Worker", version="2.1", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 
 class TranslateIn(BaseModel):
@@ -60,14 +111,38 @@ async def session() -> aiohttp.ClientSession:
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(limit=64, limit_per_host=0, ttl_dns_cache=300, keepalive_timeout=60)
         _session = aiohttp.ClientSession(
-            headers=HEADERS, connector=connector, timeout=aiohttp.ClientTimeout(total=40)
+            headers=HEADERS,
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=40),
+            trust_env=True,  # honour HTTP(S)_PROXY (PythonAnywhere)
         )
     return _session
 
 
+def _health_payload() -> dict:
+    return {
+        "status": "ok",
+        "platform": PLATFORM,
+        "proxy": bool(_PROXY),
+        "uptime": int(time.time() - _started),
+        "limits": {"max_items": MAX_ITEMS, "max_chars": MAX_CHARS},
+        **_stats,
+    }
+
+
 @app.get("/")
 async def health() -> dict:
-    return {"status": "ok", "uptime": int(time.time() - _started), **_stats}
+    return _health_payload()
+
+
+@app.get("/health")
+async def health_alias() -> dict:
+    return _health_payload()
+
+
+@app.head("/")
+async def health_head() -> dict:
+    return {}
 
 
 async def _google(texts: List[str], lang: str, source: str) -> List[str]:
@@ -77,7 +152,7 @@ async def _google(texts: List[str], lang: str, source: str) -> List[str]:
     last_err = "unknown"
     for attempt in range(3):
         try:
-            async with s.post(GOOGLE_URL, params=params, data=payload) as resp:
+            async with s.post(GOOGLE_URL, params=params, data=payload, proxy=_PROXY) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     # single item: Google returns ["text"] (a plain string, not a list)
@@ -122,4 +197,6 @@ async def translate(body: TranslateIn, x_worker_key: Optional[str] = Header(defa
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    # Hugging Face Docker Spaces expose 7860; everyone else injects $PORT.
+    default_port = "7860" if PLATFORM == "huggingface" else "8000"
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", default_port)))
