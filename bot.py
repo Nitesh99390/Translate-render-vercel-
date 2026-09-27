@@ -23,6 +23,8 @@ Environment variables (see .env.example)
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import html
 import logging
 import os
@@ -51,10 +53,12 @@ try:  # bs4 >= 4.11 warns when XHTML is parsed with an HTML parser — intended 
     warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 except Exception:  # pragma: no cover
     pass
-from pyrogram import Client, filters, idle
+from pyrogram import Client, ContinuePropagation, StopPropagation, filters, idle
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
 from pyrogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -607,6 +611,12 @@ class Database:
             "UPDATE jobs SET status=?, segments=?, chars=?, seconds=?, out_format=?, parts=? WHERE id=?",
             (status, segments, chars, round(seconds, 1), out_format, parts, job_id),
         )
+
+    def fail_interrupted_jobs(self) -> int:
+        """Jobs still 'queued'/'running' from a previous process can never finish."""
+        with self._lock, self._con:
+            cur = self._con.execute("UPDATE jobs SET status='failed' WHERE status IN ('queued','running')")
+            return cur.rowcount or 0
 
 
 db = Database(Config.DB_PATH)
@@ -1693,38 +1703,61 @@ class JobQueue:
         except Exception:
             pass
 
+    @staticmethod
+    def _user_error(e: BaseException) -> str:
+        """Friendly failure text; internal details only for known error types."""
+        if isinstance(e, TranslationError):
+            return f"❌ <b>Translation failed</b>\n{html.escape(str(e)[:300])}"
+        if isinstance(e, (zipfile.BadZipFile, ValueError)):
+            return "❌ <b>Translation failed</b>\nThe file seems to be corrupted or not a valid document."
+        if isinstance(e, MemoryError):
+            return "❌ <b>Translation failed</b>\nThe file is too large to process right now. Try splitting it or a smaller file."
+        return "❌ <b>Translation failed</b>\nUnexpected error — please try again later. If it keeps happening, contact support."
+
     async def worker_loop(self, app: Client, n: int) -> None:
         log.info("Job worker #%d started", n)
         while True:
-            job: Job = await self.queue.get()
-            if job.cancelled or job.id not in self.jobs:
-                self._cleanup(job)
-                self.queue.task_done()
-                continue
-            if db.is_banned(job.user_id):
-                db.finish_job(job.id, "cancelled")
-                self._cleanup(job)
-                self.queue.task_done()
-                await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
-                continue
-            self.running[job.id] = job
-            job.task = asyncio.create_task(self._process(app, job))
             try:
-                await job.task
+                job: Job = await self.queue.get()
             except asyncio.CancelledError:
-                if not job.cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001  (should never happen — but never die)
+                log.exception("worker #%d queue error: %s", n, e)
+                await asyncio.sleep(1)
+                continue
+            try:
+                if job.cancelled or job.id not in self.jobs:
+                    self._cleanup(job)
+                    continue
+                if db.is_banned(job.user_id):
+                    db.finish_job(job.id, "cancelled")
+                    self._cleanup(job)
+                    await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
+                    continue
+                if not job.file_path.exists():
                     db.finish_job(job.id, "failed")
                     self._cleanup(job)
-                    self.queue.task_done()
-                    raise  # the worker loop itself is being shut down
-                db.finish_job(job.id, "cancelled")
-                await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
-            except Exception as e:  # noqa: BLE001
-                log.exception("job %d failed", job.id)
-                db.finish_job(job.id, "failed")
-                await safe_edit(job.status_msg, f"❌ <b>Translation failed</b>\n<code>{html.escape(str(e)[:300])}</code>")
+                    await safe_edit(job.status_msg, "❌ File expired before processing. Please send it again.")
+                    continue
+                self.running[job.id] = job
+                db._exec("UPDATE jobs SET status='running' WHERE id=?", (job.id,))
+                job.task = asyncio.create_task(self._process(app, job))
+                try:
+                    await job.task
+                except asyncio.CancelledError:
+                    if not job.cancelled:
+                        db.finish_job(job.id, "failed")
+                        self._cleanup(job)
+                        raise  # the worker loop itself is being shut down
+                    db.finish_job(job.id, "cancelled")
+                    await safe_edit(job.status_msg, "🚫 <b>Translation cancelled.</b>")
+                except Exception as e:  # noqa: BLE001
+                    log.exception("job %d failed", job.id)
+                    db.finish_job(job.id, "failed")
+                    await safe_edit(job.status_msg, self._user_error(e) + ("\n\n🎟 Your credit has been refunded." if job.credit and not job.credit_settled else ""))
+                finally:
+                    self._cleanup(job)
             finally:
-                self._cleanup(job)
                 self.queue.task_done()
 
     async def _process(self, app: Client, job: Job) -> None:
@@ -1881,6 +1914,7 @@ payments = Payments()
 #  UI HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── reply-keyboard (the "normal" buttons under the text box) ──────────────
 BTN_LANG = "🌐 Language"
 BTN_PREMIUM = "💼 Plans"
 BTN_PREMIUM_OLD = "⭐ Premium"   # label from older keyboards still cached on users' phones
@@ -1888,24 +1922,103 @@ BTN_STATUS = "📊 Status"
 BTN_HELP = "❓ Help"
 BTN_ADMIN = "🛠 Admin"
 BTN_SETTINGS = "⚙️ Output"
-ALL_BTNS = (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN, BTN_SETTINGS)
-USER_COMMANDS = ["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
+BTN_CANCEL = "🚫 Cancel"
+ALL_BTNS = (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN, BTN_SETTINGS, BTN_CANCEL)
+USER_COMMANDS = ["start", "menu", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
+ADMIN_COMMANDS = [
+    "admin", "addworker", "delworker", "addpremium", "addplan", "addcredits", "revoke",
+    "ban", "unban", "user", "broadcast", "cancel_input",
+]
+KNOWN_COMMANDS = USER_COMMANDS + ADMIN_COMMANDS
+
+# Telegram clients sometimes send an emoji with or without the U+FE0F variation
+# selector (e.g. "⚙️" vs "⚙") and may add stray whitespace — normalise both sides
+# so a tap on a keyboard button is always recognised, on every client.
+_BTN_NORM_RE = re.compile(r"[\ufe0e\ufe0f\u200d]|\s+")
+
+
+def norm_btn(text: Optional[str]) -> str:
+    return _BTN_NORM_RE.sub("", text or "").strip().lower()
+
+
+_ALL_BTNS_NORM = {norm_btn(b) for b in ALL_BTNS}
+
+
+def is_menu_button(text: Optional[str]) -> bool:
+    return norm_btn(text) in _ALL_BTNS_NORM
+
+
+def btn(*labels: str):
+    """Filter matching one of the reply-keyboard labels (normalised)."""
+    wanted = {norm_btn(x) for x in labels}
+    return filters.create(lambda _, __, m: bool(getattr(m, "text", None)) and norm_btn(m.text) in wanted, name="btn")
 
 
 def main_kb(uid: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(BTN_LANG), KeyboardButton(BTN_SETTINGS)], [KeyboardButton(BTN_PREMIUM), KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_HELP)]]
+    rows = [
+        [KeyboardButton(BTN_LANG), KeyboardButton(BTN_SETTINGS)],
+        [KeyboardButton(BTN_PREMIUM), KeyboardButton(BTN_STATUS)],
+        [KeyboardButton(BTN_HELP), KeyboardButton(BTN_CANCEL)],
+    ]
     if Config.is_admin(uid):
         rows.append([KeyboardButton(BTN_ADMIN)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        placeholder="📎 Send a file, or pick an option",
+    )
+
+
+# ── inline keyboards ──────────────────────────────────────────────────────
+def chunk(items: List[InlineKeyboardButton], n: int) -> List[List[InlineKeyboardButton]]:
+    return [items[i:i + n] for i in range(0, len(items), n)]
+
+
+def close_btn(data: str = "ui:close") -> InlineKeyboardButton:
+    return InlineKeyboardButton("✖ Close", callback_data=data)
 
 
 def lang_kb(current: str) -> InlineKeyboardMarkup:
     btns = [InlineKeyboardButton(("✅ " if c == current else "") + n, callback_data=f"lang:{c}") for c, n in LANGUAGES.items()]
-    return InlineKeyboardMarkup([btns[i:i + 2] for i in range(0, len(btns), 2)])
+    rows = chunk(btns, 2)
+    rows.append([close_btn()])
+    return InlineKeyboardMarkup(rows)
 
 
 def cancel_kb(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel:{job_id}")]])
+
+
+def help_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🌐 Language", callback_data="ui:lang"), InlineKeyboardButton("⚙️ Output", callback_data="ui:settings")],
+            [InlineKeyboardButton("💼 Plans", callback_data="plans"), InlineKeyboardButton("📊 Status", callback_data="ui:status")],
+            [close_btn()],
+        ]
+    )
+
+
+def status_kb(uid: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    jid = jobs.by_user.get(uid)
+    if jid:
+        rows.append([InlineKeyboardButton("🚫 Cancel my file", callback_data=f"cancel:{jid}")])
+    elif uid in pending_files:
+        rows.append([InlineKeyboardButton("🚫 Discard waiting file", callback_data="opt:cancel")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="ui:status"), InlineKeyboardButton("💼 Plans", callback_data="plans")])
+    rows.append([close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+def support_btn() -> Optional[InlineKeyboardButton]:
+    c = Config.SUPPORT_CONTACT.strip()
+    if c.startswith("@") and re.fullmatch(r"@\w{5,32}", c):
+        return InlineKeyboardButton("💬 Contact support", url=f"https://t.me/{c[1:]}")
+    if c.startswith("https://") or c.startswith("http://"):
+        return InlineKeyboardButton("💬 Contact support", url=c)
+    return None
 
 
 def admin_kb() -> InlineKeyboardMarkup:
@@ -1914,21 +2027,35 @@ def admin_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🖥 Workers", callback_data="adm:workers"), InlineKeyboardButton("📈 Stats", callback_data="adm:stats")],
             [InlineKeyboardButton("📋 Queue", callback_data="adm:queue"), InlineKeyboardButton("🧹 Clear stuck", callback_data="adm:clear")],
             [InlineKeyboardButton("📣 Broadcast", callback_data="adm:bcast"), InlineKeyboardButton("🔄 Health check", callback_data="adm:health")],
-            [InlineKeyboardButton("✖ Close", callback_data="adm:close")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="adm:menu"), close_btn("adm:close")],
         ]
     )
+
+
+def worker_id(url: str) -> str:
+    """Short stable id for callback_data (URLs are too long / may reorder)."""
+    return hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def worker_by_id(wid: str) -> Optional[Worker]:
+    for w in pool.workers.values():
+        if worker_id(w.url) == wid:
+            return w
+    return None
 
 
 def workers_kb() -> InlineKeyboardMarkup:
     rows = []
     for i, w in enumerate(pool.workers.values(), 1):
+        wid = worker_id(w.url)
         rows.append(
             [
-                InlineKeyboardButton(f"{'⏸' if w.enabled else '▶'} #{i}", callback_data=f"wrk:toggle:{i-1}"),
-                InlineKeyboardButton(f"🗑 #{i}", callback_data=f"wrk:del:{i-1}"),
+                InlineKeyboardButton(f"{'⏸ Pause' if w.enabled else '▶ Enable'} #{i}", callback_data=f"wrk:toggle:{wid}"),
+                InlineKeyboardButton(f"🗑 Remove #{i}", callback_data=f"wrk:del:{wid}"),
             ]
         )
-    rows.append([InlineKeyboardButton("➕ Add worker", callback_data="wrk:add"), InlineKeyboardButton("« Back", callback_data="adm:menu")])
+    rows.append([InlineKeyboardButton("➕ Add worker", callback_data="wrk:add"), InlineKeyboardButton("🔄 Refresh", callback_data="adm:workers")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="adm:menu"), close_btn("adm:close")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1942,6 +2069,7 @@ def fmt_dt(ts: int) -> str:
 
 
 async def safe_edit(msg: Optional[Message], text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    """Edit a message; never raises (message deleted, flood-wait, network…)."""
     if msg is None:
         return
     for _ in range(2):
@@ -1955,6 +2083,86 @@ async def safe_edit(msg: Optional[Message], text: str, kb: Optional[InlineKeyboa
         except Exception as e:  # noqa: BLE001
             log.debug("edit failed: %s", e)
             return
+
+
+async def safe_answer(cq: CallbackQuery, text: str = "", alert: bool = False) -> None:
+    """Answer a callback query; ignores 'query too old' and similar errors."""
+    try:
+        await cq.answer(text[:200] if text else None, show_alert=alert)
+    except Exception as e:  # noqa: BLE001
+        log.debug("answer failed: %s", e)
+
+
+async def safe_delete(msg: Optional[Message]) -> bool:
+    if msg is None:
+        return False
+    try:
+        await msg.delete()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("delete failed: %s", e)
+        return False
+
+
+async def safe_reply(message: Message, text: str, **kw) -> Optional[Message]:
+    """reply_text that survives flood-waits and users who blocked the bot."""
+    kw.setdefault("disable_web_page_preview", True)
+    for _ in range(2):
+        try:
+            return await message.reply_text(text, **kw)
+        except FloodWait as e:
+            await asyncio.sleep(min(e.value, 30))
+        except Exception as e:  # noqa: BLE001
+            log.debug("reply failed: %s", e)
+            return None
+    return None
+
+
+async def safe_send(client: Client, chat_id: int, text: str, **kw) -> Optional[Message]:
+    kw.setdefault("disable_web_page_preview", True)
+    try:
+        return await client.send_message(chat_id, text, **kw)
+    except FloodWait as e:
+        await asyncio.sleep(min(e.value, 30))
+        try:
+            return await client.send_message(chat_id, text, **kw)
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception as e:  # noqa: BLE001
+        log.debug("send failed to %s: %s", chat_id, e)
+        return None
+
+
+ERR_TEXT = "⚠️ Something went wrong on our side. Please try again in a moment."
+
+
+def guarded(fn):
+    """Wrap a Pyrogram handler so an unexpected exception is logged and the
+    user gets a friendly message instead of a silently spinning button.
+    Pyrogram's own dispatcher only logs the traceback — the user would see
+    nothing at all.  Stop/ContinuePropagation are passed through untouched."""
+
+    @functools.wraps(fn)
+    async def wrapper(client: Client, update, *a, **kw):
+        try:
+            return await fn(client, update, *a, **kw)
+        except (StopPropagation, ContinuePropagation):
+            raise
+        except asyncio.CancelledError:
+            raise
+        except FloodWait as e:
+            log.warning("%s: flood wait %ss", fn.__name__, e.value)
+        except Exception as e:  # noqa: BLE001
+            log.exception("handler %s crashed: %s", fn.__name__, e)
+            try:
+                if isinstance(update, CallbackQuery):
+                    await safe_answer(update, ERR_TEXT, alert=True)
+                elif isinstance(update, Message):
+                    await safe_reply(update, ERR_TEXT)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return wrapper
 
 
 def user_line(row: sqlite3.Row) -> str:
@@ -2068,6 +2276,8 @@ class PendingFile:
     split_kb: int = 0
     awaiting_custom: bool = False
     timer: Optional[asyncio.Task] = None
+    deadline: float = 0.0      # monotonic time when the panel auto-starts
+    starting: bool = False     # start_job already running (guards double taps / timer race)
 
 
 pending_files: Dict[int, PendingFile] = {}
@@ -2103,36 +2313,43 @@ def split_label(kb: int) -> str:
 def options_kb(prefix: str, out_ext: str, split_kb: int, in_ext: str = "", ask: Optional[bool] = None) -> InlineKeyboardMarkup:
     """Shared keyboard for the per-file panel (prefix 'opt') and /settings ('set')."""
     fmts = docconv.available_outputs()
-    row: List[InlineKeyboardButton] = []
     rows: List[List[InlineKeyboardButton]] = []
-    same_sel = not out_ext or (in_ext and docconv.same_kind(out_ext, in_ext))
+    same_sel = not out_ext or bool(in_ext and docconv.same_kind(out_ext, in_ext))
+    # ── format ──
     rows.append([InlineKeyboardButton(("✅ " if same_sel else "") + "📄 Same as input", callback_data=f"{prefix}:fmt:same")])
-    for ext in fmts:
-        sel = bool(out_ext) and not same_sel and docconv.same_kind(ext, out_ext)
-        row.append(InlineKeyboardButton(("✅ " if sel else "") + docconv.label_of(ext), callback_data=f"{prefix}:fmt:{ext}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    srow = [InlineKeyboardButton(("✅ " if split_kb <= 0 else "") + "✂️ No split", callback_data=f"{prefix}:split:0")]
+    fbtns = [
+        InlineKeyboardButton(
+            ("✅ " if (bool(out_ext) and not same_sel and docconv.same_kind(ext, out_ext)) else "") + docconv.label_of(ext),
+            callback_data=f"{prefix}:fmt:{ext}",
+        )
+        for ext in fmts
+    ]
+    rows += chunk(fbtns, 3)
+    # ── split ──
+    presets = {mb * 1024 for mb in Config.SPLIT_PRESETS_MB}
+    custom_sel = split_kb > 0 and split_kb not in presets
+    sbtns = [InlineKeyboardButton(("✅ " if split_kb <= 0 else "") + "✂️ No split", callback_data=f"{prefix}:split:0")]
     for mb in Config.SPLIT_PRESETS_MB:
         kb = mb * 1024
-        srow.append(InlineKeyboardButton(("✅ " if split_kb == kb else "") + f"{mb} MB", callback_data=f"{prefix}:split:{kb}"))
-    rows.append(srow[:2])
-    custom_sel = split_kb > 0 and split_kb not in {mb * 1024 for mb in Config.SPLIT_PRESETS_MB}
-    rows.append(srow[2:] + [InlineKeyboardButton(("✅ " if custom_sel else "") + "✏️ Custom…", callback_data=f"{prefix}:custom")])
+        sbtns.append(InlineKeyboardButton(("✅ " if split_kb == kb else "") + f"{mb} MB", callback_data=f"{prefix}:split:{kb}"))
+    sbtns.append(InlineKeyboardButton(("✅ " if custom_sel else "") + ("✏️ Custom" + (f" ({fmt_kb(split_kb)})" if custom_sel else "…")), callback_data=f"{prefix}:custom"))
+    rows += chunk(sbtns, 3)
+    # ── actions ──
     if prefix == "opt":
         rows.append([InlineKeyboardButton("▶️ Start translation", callback_data="opt:start")])
         rows.append([InlineKeyboardButton("💾 Save as default", callback_data="opt:save"), InlineKeyboardButton("🚫 Cancel", callback_data="opt:cancel")])
     else:
-        rows.append([InlineKeyboardButton(f"💬 Ask for every file: {'ON' if ask else 'OFF'}", callback_data="set:ask")])
-        rows.append([InlineKeyboardButton("✖ Close", callback_data="set:close")])
+        rows.append([InlineKeyboardButton(f"💬 Ask for every file: {'✅ ON' if ask else '❌ OFF'}", callback_data="set:ask")])
+        rows.append([InlineKeyboardButton("↩️ Reset defaults", callback_data="set:reset"), close_btn("set:close")])
     return InlineKeyboardMarkup(rows)
 
 
 def options_text(pf: PendingFile) -> str:
-    size = pf.path.stat().st_size if pf.path.exists() else 0
+    try:
+        size = pf.path.stat().st_size
+    except OSError:
+        size = 0
+    left = max(0, int(pf.deadline - time.monotonic())) if pf.deadline else Config.OPTIONS_TIMEOUT
     return (
         "⚙️ <b>Output options</b>\n"
         f"📄 {html.escape(pf.name)} · {docconv.fmt_size(size)}\n"
@@ -2140,8 +2357,17 @@ def options_text(pf: PendingFile) -> str:
         f"📤 Format: <b>{out_format_label(pf.out_ext, pf.ext)}</b>\n"
         f"✂️ Split: <b>{split_label(pf.split_kb)}</b>\n\n"
         f"Pick a format / split size, then tap <b>▶️ Start</b>. "
-        f"Starts automatically in {Config.OPTIONS_TIMEOUT}s."
+        f"Starts automatically in ~{left}s."
     )
+
+
+def _ask_on(row: sqlite3.Row) -> bool:
+    v = row["ask_options"]
+    return bool(v) if v is not None else True
+
+
+def settings_kb_for(row: sqlite3.Row) -> InlineKeyboardMarkup:
+    return options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=_ask_on(row))
 
 
 def settings_text(row: sqlite3.Row) -> str:
@@ -2149,7 +2375,7 @@ def settings_text(row: sqlite3.Row) -> str:
         "⚙️ <b>Output settings</b> (defaults for every file)\n\n"
         f"📤 Format: <b>{out_format_label(row['out_format'] or '')}</b>\n"
         f"✂️ Split: <b>{split_label(int(row['split_kb'] or 0))}</b>\n"
-        f"💬 Ask for every file: <b>{'ON' if row['ask_options'] else 'OFF'}</b>\n\n"
+        f"💬 Ask for every file: <b>{'ON' if _ask_on(row) else 'OFF'}</b>\n\n"
         "• <b>Format</b> — get the translation back as EPUB, PDF, DOCX, TXT or HTML regardless of what you send.\n"
         "• <b>Split</b> — big results are cut into several files no larger than the chosen size "
         "(EPUB by chapters, PDF by pages, DOCX/HTML/TXT by paragraphs).\n"
@@ -2196,6 +2422,31 @@ async def check_force_sub(client: Client, uid: int) -> bool:
         return True
 
 
+_invite_cache: Dict[str, str] = {}
+
+
+async def force_sub_link(client: Client) -> Optional[str]:
+    """Public @username → t.me link; private numeric id → exported invite link (cached)."""
+    ch = Config.FORCE_SUB_CHANNEL
+    if not ch:
+        return None
+    if ch.startswith("@"):
+        return f"https://t.me/{ch.lstrip('@')}"
+    if ch in _invite_cache:
+        return _invite_cache[ch]
+    try:
+        chat = await client.get_chat(_chat_ref(ch))
+        link = getattr(chat, "invite_link", None) or (f"https://t.me/{chat.username}" if getattr(chat, "username", None) else None)
+        if not link:
+            link = await client.export_chat_invite_link(_chat_ref(ch))
+        if link:
+            _invite_cache[ch] = link
+        return link
+    except Exception as e:  # noqa: BLE001
+        log.warning("cannot build force-sub invite link: %s", e)
+        return None
+
+
 async def guard(client: Client, message: Message) -> Optional[sqlite3.Row]:
     """Common per-message checks. Returns user row or None if blocked."""
     u = message.from_user
@@ -2203,40 +2454,45 @@ async def guard(client: Client, message: Message) -> Optional[sqlite3.Row]:
         return None
     row = db.upsert_user(u.id, u.first_name or "", u.username)
     if row["banned"]:
-        await message.reply_text("🚫 You are banned from using this bot.")
+        await safe_reply(message, "🚫 You are banned from using this bot.")
         return None
     if not await check_force_sub(client, u.id):
-        ch = Config.FORCE_SUB_CHANNEL
-        link = f"https://t.me/{ch.lstrip('@')}" if ch.startswith("@") else None
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join channel", url=link)]]) if link else None
-        await message.reply_text("📢 Please join our channel first, then send /start again.", reply_markup=kb)
+        link = await force_sub_link(client)
+        rows = [[InlineKeyboardButton("📢 Join channel", url=link)]] if link else []
+        rows.append([InlineKeyboardButton("✅ I've joined", callback_data="ui:recheck")])
+        await safe_reply(message, "📢 Please join our channel first, then tap <b>I've joined</b>.", reply_markup=InlineKeyboardMarkup(rows))
         return None
     return row
 
 
+async def cq_user(cq: CallbackQuery) -> sqlite3.Row:
+    """Upsert + return the user row behind a callback query."""
+    return db.upsert_user(cq.from_user.id, cq.from_user.first_name or "", cq.from_user.username)
+
+
+def start_text(row: sqlite3.Row, first_name: str) -> str:
+    return (
+        f"👋 <b>Welcome, {html.escape(first_name or 'there')}!</b>\n\n"
+        "I translate <b>EPUB · PDF · DOCX · TXT · HTML</b> files into your language while keeping "
+        "the original formatting, images and chapters intact.\n\n"
+        f"🌐 Target language: <b>{lang_name(row['lang'])}</b>\n"
+        f"💼 Plan: {user_line(row)}\n\n"
+        "📎 <b>Send me a file to begin</b>, or use the buttons below."
+    )
+
+
 # ── /start ─────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & filters.command("start"))
+@app.on_message(filters.private & filters.command(["start", "menu"]))
+@guarded
 async def cmd_start(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    await message.reply_text(
-        f"👋 <b>Welcome, {html.escape(message.from_user.first_name or 'there')}!</b>\n\n"
-        "I translate <b>EPUB books</b> into your language while keeping the original "
-        "formatting, images and chapters intact.\n\n"
-        f"🌐 Target language: <b>{lang_name(row['lang'])}</b>\n"
-        f"💼 Plan: {user_line(row)}\n\n"
-        "📎 <b>Send me a file to begin</b> — EPUB · PDF · DOCX · TXT · HTML",
-        reply_markup=main_kb(message.from_user.id),
-    )
+    await safe_reply(message, start_text(row, message.from_user.first_name), reply_markup=main_kb(message.from_user.id))
 
 
-# ── /help ──────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command("help") | filters.regex(f"^{re.escape(BTN_HELP)}$")))
-async def cmd_help(client: Client, message: Message) -> None:
-    if not await guard(client, message):
-        return
-    await message.reply_text(
+def help_text() -> str:
+    return (
         "📖 <b>How it works</b>\n"
         "1. Choose your language with <b>🌐 Language</b>\n"
         "2. Send a file: <b>.epub · .pdf · .docx · .txt · .md · .html</b>\n"
@@ -2256,44 +2512,61 @@ async def cmd_help(client: Client, message: Message) -> None:
         "→ all plans: /plans\n\n"
         "<b>Commands</b>\n"
         "/start · /help · /lang · /settings · /status · /plans · /cancel\n\n"
-        f"💬 Support: {html.escape(Config.SUPPORT_CONTACT)}",
-        disable_web_page_preview=True,
+        f"💬 Support: {html.escape(Config.SUPPORT_CONTACT)}"
     )
 
 
+# ── /help ──────────────────────────────────────────────────────────────────
+@app.on_message(filters.private & (filters.command("help") | btn(BTN_HELP)))
+@guarded
+async def cmd_help(client: Client, message: Message) -> None:
+    if not await guard(client, message):
+        return
+    await safe_reply(message, help_text(), reply_markup=help_kb())
+
+
 # ── language ───────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command("lang") | filters.regex(f"^{re.escape(BTN_LANG)}$")))
+@app.on_message(filters.private & (filters.command("lang") | btn(BTN_LANG)))
+@guarded
 async def cmd_lang(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    await message.reply_text("🌐 <b>Choose target language</b>", reply_markup=lang_kb(row["lang"]))
+    await safe_reply(message, f"🌐 <b>Choose target language</b>\nCurrent: <b>{lang_name(row['lang'])}</b>", reply_markup=lang_kb(row["lang"]))
 
 
 @app.on_callback_query(filters.regex(r"^lang:(.+)$"))
+@guarded
 async def cb_lang(client: Client, cq: CallbackQuery) -> None:
     code = cq.matches[0].group(1)
     if code not in LANGUAGES:
-        return await cq.answer("Unknown language", show_alert=True)
-    db.upsert_user(cq.from_user.id, cq.from_user.first_name or "", cq.from_user.username)
+        return await safe_answer(cq, "Unknown language", alert=True)
+    await cq_user(cq)
     db.set_lang(cq.from_user.id, code)
-    await cq.answer(f"Language set: {lang_name(code)}")
-    await safe_edit(cq.message, f"🌐 Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me a file (EPUB · PDF · DOCX · TXT · HTML).")
+    # a file waiting on the options panel should follow the new language too
+    pf = pending_files.get(cq.from_user.id)
+    if pf:
+        pf.lang = code
+        await safe_edit(pf.status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
+    await safe_answer(cq, f"Language set: {lang_name(code)}")
+    await safe_edit(
+        cq.message,
+        f"🌐 Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me a file (EPUB · PDF · DOCX · TXT · HTML).",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Change again", callback_data="ui:lang"), close_btn()]]),
+    )
 
 
 # ── status ─────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command("status") | filters.regex(f"^{re.escape(BTN_STATUS)}$")))
-async def cmd_status(client: Client, message: Message) -> None:
-    row = await guard(client, message)
-    if not row:
-        return
-    uid = message.from_user.id
+def status_text(row: sqlite3.Row) -> str:
+    uid = row["id"]
     mine = ""
-    if uid in jobs.by_user:
-        jid = jobs.by_user[uid]
+    jid = jobs.by_user.get(uid)
+    if jid:
         pos = jobs.position(jid)
-        mine = "\n\n📌 <b>Your file</b>: " + ("processing now" if jid in jobs.running else f"queue position #{pos}")
-    await message.reply_text(
+        mine = "\n\n📌 <b>Your file</b>: " + ("⚙️ processing now" if jid in jobs.running else f"⏳ queue position #{pos}")
+    elif uid in pending_files:
+        mine = "\n\n📌 <b>Your file</b>: waiting for you to pick output options"
+    return (
         "📊 <b>Status</b>\n"
         f"🌐 Language: <b>{lang_name(row['lang'])}</b>\n"
         f"💼 Plan: {user_line(row)}\n"
@@ -2303,56 +2576,115 @@ async def cmd_status(client: Client, message: Message) -> None:
     )
 
 
+@app.on_message(filters.private & (filters.command("status") | btn(BTN_STATUS)))
+@guarded
+async def cmd_status(client: Client, message: Message) -> None:
+    row = await guard(client, message)
+    if not row:
+        return
+    await safe_reply(message, status_text(row), reply_markup=status_kb(row["id"]))
+
+
+# ── generic UI callbacks (close / open panels from inline buttons) ─────────
+@app.on_callback_query(filters.regex(r"^ui:(\w+)$"))
+@guarded
+async def cb_ui(client: Client, cq: CallbackQuery) -> None:
+    action = cq.matches[0].group(1)
+    row = await cq_user(cq)
+    if action == "close":
+        await safe_answer(cq)
+        if not await safe_delete(cq.message):
+            await safe_edit(cq.message, "✖ Closed.")
+        return
+    if row["banned"]:
+        return await safe_answer(cq, "🚫 You are banned from using this bot.", alert=True)
+    if action == "recheck":
+        if await check_force_sub(client, cq.from_user.id):
+            await safe_answer(cq, "✅ Thanks for joining!")
+            await safe_edit(cq.message, start_text(row, cq.from_user.first_name or ""))
+            if cq.message:
+                await safe_send(client, cq.message.chat.id, "📎 Send me a file to begin.", reply_markup=main_kb(cq.from_user.id))
+        else:
+            await safe_answer(cq, "❌ You have not joined yet.", alert=True)
+        return
+    await safe_answer(cq)
+    if action == "lang":
+        await safe_edit(cq.message, f"🌐 <b>Choose target language</b>\nCurrent: <b>{lang_name(row['lang'])}</b>", lang_kb(row["lang"]))
+    elif action == "settings":
+        await safe_edit(cq.message, settings_text(row), settings_kb_for(row))
+    elif action == "status":
+        await safe_edit(cq.message, status_text(row), status_kb(row["id"]))
+    elif action == "help":
+        await safe_edit(cq.message, help_text(), help_kb())
+    elif action == "start":
+        await safe_edit(cq.message, start_text(row, cq.from_user.first_name or ""), help_kb())
+    else:
+        await safe_answer(cq, "Unknown action.", alert=True)
+
+
 # ── plans / premium ────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command(["premium", "pay", "plans", "plan", "buy"]) | filters.regex(f"^({re.escape(BTN_PREMIUM)}|{re.escape(BTN_PREMIUM_OLD)})$")))
+@app.on_message(filters.private & (filters.command(["premium", "pay", "plans", "plan", "buy"]) | btn(BTN_PREMIUM, BTN_PREMIUM_OLD)))
+@guarded
 async def cmd_premium(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    await message.reply_text(plans_text(row), reply_markup=plans_kb(message.from_user.id), disable_web_page_preview=True)
+    await safe_reply(message, plans_text(row), reply_markup=plans_kb(message.from_user.id))
 
 
 @app.on_callback_query(filters.regex(r"^plans$"))
+@guarded
 async def cb_plans_menu(client: Client, cq: CallbackQuery) -> None:
-    row = db.upsert_user(cq.from_user.id, cq.from_user.first_name or "", cq.from_user.username)
-    await cq.answer()
+    row = await cq_user(cq)
+    await safe_answer(cq)
     await safe_edit(cq.message, plans_text(row), plans_kb(cq.from_user.id))
 
 
 @app.on_callback_query(filters.regex(r"^plan:(\w+)$"))
+@guarded
 async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
     plan = PLANS.get(cq.matches[0].group(1))
     if not plan:
-        return await cq.answer("Unknown plan.", show_alert=True)
+        return await safe_answer(cq, "Unknown plan.", alert=True)
     uid = cq.from_user.id
-    db.upsert_user(uid, cq.from_user.first_name or "", cq.from_user.username)
+    await cq_user(cq)
     back = InlineKeyboardButton("« All plans", callback_data="plans")
 
     # unlimited users don't need a smaller sub — but credit packs/extension are always allowed
     cur = db.active_sub(uid)
     if plan.is_sub and cur and cur.daily_limit == 0 and plan.daily_limit != 0:
-        return await cq.answer(f"You already have {cur.title} (unlimited) — no need for {plan.title}.", show_alert=True)
+        return await safe_answer(cq, f"You already have {cur.title} (unlimited) — no need for {plan.title}.", alert=True)
 
     if not payments.enabled:
-        await cq.answer()
+        await safe_answer(cq)
+        rows = [[back, close_btn()]]
+        sb = support_btn()
+        if sb:
+            rows.insert(0, [sb])
         return await safe_edit(
             cq.message,
             plan_detail_text(plan) + f"\n\n💬 Payments are handled manually — contact {html.escape(Config.SUPPORT_CONTACT)} to buy.",
-            InlineKeyboardMarkup([[back]]),
+            InlineKeyboardMarkup(rows),
         )
+    # answer first: creating a Razorpay link can take a few seconds and the
+    # callback would otherwise time out (button spins forever)
+    await safe_answer(cq, "Creating payment link…")
     try:
         link_id, url = await payments.create_link(uid, plan)
     except Exception as e:  # noqa: BLE001
         log.error("payment link error: %s", e)
-        return await cq.answer("⚠️ Payment service temporarily unavailable. Please try later.", show_alert=True)
+        return await safe_edit(
+            cq.message,
+            plan_detail_text(plan) + "\n\n⚠️ Payment service temporarily unavailable. Please try again in a few minutes.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")], [back, close_btn()]]),
+        )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(f"💳 Pay ₹{plan.price}", url=url)],
             [InlineKeyboardButton("✅ I've paid — verify", callback_data=f"pay:{link_id}")],
-            [back],
+            [back, close_btn()],
         ]
     )
-    await cq.answer()
     await safe_edit(cq.message, plan_detail_text(plan), kb)
 
 
@@ -2375,68 +2707,90 @@ def _activate_payment(p: sqlite3.Row) -> str:
     )
 
 
+# one verification at a time per payment link (double-tap protection)
+_pay_locks: Dict[str, asyncio.Lock] = {}
+
+
 @app.on_callback_query(filters.regex(r"^pay:(.+)$"))
+@guarded
 async def cb_pay(client: Client, cq: CallbackQuery) -> None:
     link_id = cq.matches[0].group(1)
     p = db.get_payment(link_id)
     if not p or p["user_id"] != cq.from_user.id:
-        return await cq.answer("Payment not found.", show_alert=True)
+        return await safe_answer(cq, "Payment not found.", alert=True)
     if p["status"] == "paid":
-        return await cq.answer("Already activated ✅", show_alert=True)
+        return await safe_answer(cq, "Already activated ✅", alert=True)
     if not payments.enabled:
-        return await cq.answer("Payment service is not configured.", show_alert=True)
-    # a callback query can only be answered ONCE — so verify first, answer after
-    if await payments.verify(link_id):
+        return await safe_answer(cq, "Payment service is not configured.", alert=True)
+    lock = _pay_locks.setdefault(link_id, asyncio.Lock())
+    if lock.locked():
+        return await safe_answer(cq, "Verifying… please wait.")
+    async with lock:
+        # a callback query can only be answered ONCE — so verify first, answer after
+        paid = await payments.verify(link_id)
+        if not paid:
+            return await safe_answer(cq, "Payment not received yet. Complete the payment and try again in a minute.", alert=True)
         # re-check: two quick taps must not grant twice
         fresh = db.get_payment(link_id)
         if fresh is None or fresh["status"] == "paid":
-            return await cq.answer("Already activated ✅", show_alert=True)
+            return await safe_answer(cq, "Already activated ✅", alert=True)
         db.mark_paid(link_id)
         text = _activate_payment(p)
-        await cq.answer("Payment verified ✅")
-        await safe_edit(cq.message, text)
-        if Config.OWNER_ID:
-            try:
-                plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
-                await client.send_message(
-                    Config.OWNER_ID,
-                    f"💰 New payment ₹{p['amount']} · {plan_name} from <code>{p['user_id']}</code> (@{cq.from_user.username or '-'})",
-                )
-            except Exception:
-                pass
-    else:
-        await cq.answer("Payment not received yet. Complete the payment and try again in a minute.", show_alert=True)
+    _pay_locks.pop(link_id, None)
+    await safe_answer(cq, "Payment verified ✅")
+    await safe_edit(cq.message, text, InlineKeyboardMarkup([[InlineKeyboardButton("📊 My status", callback_data="ui:status"), close_btn()]]))
+    if Config.OWNER_ID:
+        plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
+        await safe_send(
+            client,
+            Config.OWNER_ID,
+            f"💰 New payment ₹{p['amount']} · {plan_name} from <code>{p['user_id']}</code> (@{cq.from_user.username or '-'})",
+        )
 
 
 # ── cancel ─────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & filters.command("cancel"))
-async def cmd_cancel(client: Client, message: Message) -> None:
-    if not message.from_user:
-        return
-    uid = message.from_user.id
+async def cancel_everything(uid: int) -> str:
+    """Discard a waiting file and/or cancel the queued/running job. Returns user text."""
     pf = pending_files.get(uid)
     if pf:
         _discard_pending(pf)
         shutil.rmtree(pf.path.parent, ignore_errors=True)
         await safe_edit(pf.status, "🚫 <b>Cancelled.</b>")
-        return await message.reply_text("🚫 File discarded.")
+        return "🚫 File discarded. Send another one whenever you like."
     jid = jobs.by_user.get(uid)
     if jid and jobs.cancel(jid):
-        await message.reply_text("🚫 Your translation has been cancelled.")
-    else:
-        await message.reply_text("You have no active translation.")
+        return "🚫 Your translation is being cancelled."
+    if uid in downloading:
+        return "📥 Your file is still downloading — try again in a few seconds."
+    return "ℹ️ You have no active translation right now."
+
+
+@app.on_message(filters.private & (filters.command("cancel") | btn(BTN_CANCEL)))
+@guarded
+async def cmd_cancel(client: Client, message: Message) -> None:
+    if not message.from_user:
+        return
+    await safe_reply(message, await cancel_everything(message.from_user.id))
 
 
 @app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
+@guarded
 async def cb_cancel(client: Client, cq: CallbackQuery) -> None:
     jid = int(cq.matches[0].group(1))
     job = jobs.jobs.get(jid)
     if not job:
-        return await cq.answer("Job already finished.", show_alert=True)
+        await safe_answer(cq, "This job has already finished.", alert=True)
+        # remove the stale button so the user does not keep tapping it
+        try:
+            if cq.message and cq.message.reply_markup:
+                await cq.message.edit_reply_markup(None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if job.user_id != cq.from_user.id and not Config.is_admin(cq.from_user.id):
-        return await cq.answer("Not your job.", show_alert=True)
+        return await safe_answer(cq, "Not your job.", alert=True)
     jobs.cancel(jid)
-    await cq.answer("Cancelling…")
+    await safe_answer(cq, "Cancelling…")
     if jid not in jobs.running:
         await safe_edit(cq.message, "🚫 <b>Translation cancelled.</b>")
 
@@ -2459,40 +2813,57 @@ def _sniff_ok(path: Path, ext: str) -> bool:
 
 
 @app.on_message(filters.private & filters.document)
+@guarded
 async def on_document(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
     uid = message.from_user.id
-    if uid in pending_input:  # admin is sending a broadcast attachment
+    # admin is sending a broadcast attachment → leave it to on_admin_input.
+    # (Only the *admin* modes — a user waiting to type a custom split size
+    # must still be able to send a file; previously the file was silently ignored.)
+    if pending_input.get(uid) in ("broadcast", "add_worker"):
         return
     doc = message.document
+    if doc is None:
+        return
     ext = detect_format(doc.file_name or "", doc.mime_type)
     if not ext:
-        return await message.reply_text(
-            "⚠️ Unsupported file type.\n\nSupported: <b>" + " · ".join(sorted(SUPPORTED_FORMATS)) + "</b>"
+        return await safe_reply(
+            message,
+            "⚠️ Unsupported file type.\n\nSupported: <b>" + " · ".join(sorted(SUPPORTED_FORMATS)) + "</b>",
         )
     if ext == ".pdf" and pymupdf is None:
-        return await message.reply_text("⚠️ PDF support is not installed on this server.")
+        return await safe_reply(message, "⚠️ PDF support is not installed on this server.")
     name = doc.file_name or f"document{ext}"
     if not name.lower().endswith(ext):
         name += ext
 
     access = resolve_access(uid)
     if access.source == "blocked":
-        return await message.reply_text(access.reason, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
+        return await safe_reply(message, access.reason, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
     file_size = doc.file_size or 0
     if file_size > access.max_mb * 1024 * 1024:
         hint = ""
+        kb = None
         if access.source != "admin" and access.max_mb < Config.PREMIUM_MAX_FILE_MB:
-            hint = f"\n⭐ Premium allows files up to {Config.PREMIUM_MAX_FILE_MB} MB — /plans"
-        return await message.reply_text(
-            f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{access.max_mb} MB</b>." + hint
+            hint = f"\n⭐ Premium allows files up to {Config.PREMIUM_MAX_FILE_MB} MB."
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]])
+        return await safe_reply(
+            message,
+            f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{access.max_mb} MB</b>." + hint,
+            reply_markup=kb,
         )
+    if file_size > Config.TG_MAX_FILE_MB * 1024 * 1024:
+        return await safe_reply(message, f"⚠️ Telegram bots can only download files up to {Config.TG_MAX_FILE_MB} MB.")
     if jobs.user_has_job(uid) or uid in downloading or uid in pending_files:
-        return await message.reply_text("⚠️ You already have a file in progress. Use /cancel to stop it first.")
+        return await safe_reply(
+            message,
+            "⚠️ You already have a file in progress. Cancel it first if you want to send another one.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Status", callback_data="ui:status")]]),
+        )
     if not pool.available() and not Config.DIRECT_FALLBACK and Config.DIRECT_CONCURRENCY <= 0:
-        return await message.reply_text("⚠️ Translation service is offline right now. Please try again later.")
+        return await safe_reply(message, "⚠️ Translation service is offline right now. Please try again later.")
 
     # reserve the user's slot *before* the (slow) download so two files sent
     # back-to-back cannot both slip past the "one job per user" check
@@ -2500,11 +2871,14 @@ async def on_document(client: Client, message: Message) -> None:
     status: Optional[Message] = None
     tmp_dir: Optional[Path] = None
     try:
-        status = await message.reply_text("📥 <b>Downloading…</b>")
+        status = await safe_reply(message, "📥 <b>Downloading…</b>")
+        if status is None:  # user blocked the bot / chat unavailable
+            return
         tmp_dir = Path(tempfile.mkdtemp(prefix="epub_", dir=Config.DATA_DIR))
-        safe_name = re.sub(r"[^\w.\- ]", "_", name).strip() or f"document{ext}"
+        safe_name = re.sub(r"[^\w.\- ]", "_", name).strip(" ._") or f"document{ext}"
         if not safe_name.lower().endswith(ext):
             safe_name += ext
+        safe_name = safe_name[-120:]  # keep the path short on every filesystem
         try:
             path = await message.download(file_name=str(tmp_dir / safe_name))
         except Exception as e:  # noqa: BLE001
@@ -2514,15 +2888,22 @@ async def on_document(client: Client, message: Message) -> None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
             return
+        # user cancelled (/cancel) or got banned while the file was downloading
+        fresh = db.get_user(uid)
+        if fresh is None or fresh["banned"]:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            await safe_edit(status, "🚫 <b>Cancelled.</b>")
+            return
 
         pf = PendingFile(
             uid=uid, chat_id=message.chat.id, path=Path(path), name=name, ext=ext, lang=row["lang"], status=status,
             out_ext=row["out_format"] or "", split_kb=int(row["split_kb"] or 0),
         )
-        if not (row["ask_options"] if row["ask_options"] is not None else 1):
+        if not _ask_on(row):
             await start_job(pf)                     # defaults, no questions asked
             return
         pending_files[uid] = pf
+        pf.deadline = time.monotonic() + Config.OPTIONS_TIMEOUT
         pf.timer = asyncio.create_task(_options_timeout(uid))
         await safe_edit(status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
     except Exception as e:  # noqa: BLE001
@@ -2530,7 +2911,9 @@ async def on_document(client: Client, message: Message) -> None:
         # (previously an unexpected error here meant "You already have a file in
         # progress" until the bot was restarted)
         log.exception("on_document failed for %s: %s", uid, e)
-        pending_files.pop(uid, None)
+        pf = pending_files.pop(uid, None)
+        if pf and pf.timer and not pf.timer.done():
+            pf.timer.cancel()
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         await safe_edit(status, "❌ Something went wrong while receiving the file. Please try again.")
@@ -2540,27 +2923,55 @@ async def on_document(client: Client, message: Message) -> None:
 
 
 async def _options_timeout(uid: int) -> None:
-    """Auto-start with the current selection when the user does not answer."""
+    """Auto-start with the current selection when the user does not answer.
+    While the user is typing a custom size the deadline is pushed back instead
+    of leaving the file (and the user's slot) waiting forever."""
     try:
-        await asyncio.sleep(Config.OPTIONS_TIMEOUT)
+        while True:
+            pf = pending_files.get(uid)
+            if pf is None:
+                return
+            wait = pf.deadline - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(min(wait, 5))
+                continue
+            if pf.awaiting_custom:
+                # give them one more window, then start anyway
+                pf.awaiting_custom = False
+                pf.deadline = time.monotonic() + Config.OPTIONS_TIMEOUT
+                await safe_edit(pf.status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
+                continue
+            break
     except asyncio.CancelledError:
         return
     pf = pending_files.get(uid)
-    if pf and not pf.awaiting_custom:
+    if pf and not pf.starting:
         await start_job(pf)
 
 
 def _discard_pending(pf: PendingFile) -> None:
     pending_files.pop(pf.uid, None)
-    if pf.timer and not pf.timer.done():
+    if pf.timer and not pf.timer.done() and pf.timer is not asyncio.current_task():
         pf.timer.cancel()
 
 
 async def start_job(pf: PendingFile) -> None:
     """Charge the user's entitlement and put the pending file into the queue."""
+    if pf.starting:
+        return  # ▶️ tapped twice / timer fired at the same moment
+    pf.starting = True
     _discard_pending(pf)
     uid = pf.uid
     tmp_dir = pf.path.parent
+    try:
+        await _start_job_inner(pf, uid, tmp_dir)
+    except Exception as e:  # noqa: BLE001
+        log.exception("start_job failed for %s: %s", uid, e)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(pf.status, ERR_TEXT)
+
+
+async def _start_job_inner(pf: PendingFile, uid: int, tmp_dir: Path) -> None:
     if not pf.path.exists():
         await safe_edit(pf.status, "❌ File expired. Please send it again.")
         return
@@ -2568,11 +2979,15 @@ async def start_job(pf: PendingFile) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         await safe_edit(pf.status, "⚠️ You already have a file in progress. Use /cancel to stop it first.")
         return
+    if db.is_banned(uid):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(pf.status, "🚫 <b>Cancelled.</b>")
+        return
     # Re-resolve now: quota may have changed while the file was downloading / waiting.
     access = resolve_access(uid)
     if access.source == "blocked":
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        await safe_edit(pf.status, access.reason)
+        await safe_edit(pf.status, access.reason, InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
         return
     if pf.path.stat().st_size > access.max_mb * 1024 * 1024:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2616,29 +3031,63 @@ async def start_job(pf: PendingFile) -> None:
     )
 
 
+def clear_set_custom(uid: int) -> None:
+    """Forget a pending 'type your default split size' prompt (only that mode)."""
+    if pending_input.get(uid) == "set_custom":
+        pending_input.pop(uid, None)
+
+
+def _validate_split(kb: Optional[int]) -> Optional[str]:
+    """None → valid; else a user-facing error."""
+    if kb is None:
+        return "⚠️ Please send a size like <code>500kb</code> or <code>25mb</code> (or <code>0</code> for no split)."
+    if kb and kb < Config.SPLIT_MIN_KB:
+        return f"⚠️ Minimum split size is {Config.SPLIT_MIN_KB} KB."
+    if kb > Config.TG_MAX_FILE_MB * 1024:
+        return f"⚠️ Telegram files can't exceed {Config.TG_MAX_FILE_MB} MB."
+    return None
+
+
 @app.on_callback_query(filters.regex(r"^opt:(\w+)(?::(.+))?$"))
+@guarded
 async def cb_options(client: Client, cq: CallbackQuery) -> None:
     uid = cq.from_user.id
     pf = pending_files.get(uid)
     action, arg = cq.matches[0].group(1), cq.matches[0].group(2) or ""
-    if not pf or (cq.message and pf.status.id != cq.message.id):
-        return await cq.answer("This file is no longer waiting — send it again.", show_alert=True)
+    if not pf or (cq.message and pf.status and pf.status.id != cq.message.id):
+        await safe_answer(cq, "This file is no longer waiting — send it again.", alert=True)
+        # stale panel: drop its buttons so it cannot be tapped again
+        try:
+            if cq.message and cq.message.reply_markup and not pf:
+                await cq.message.edit_reply_markup(None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if pf.starting:
+        return await safe_answer(cq, "Already starting…")
+    # every interaction gives the user a fresh window before auto-start
+    pf.deadline = max(pf.deadline, time.monotonic() + min(Config.OPTIONS_TIMEOUT, 45))
     if action == "fmt":
         if arg == "same":
             pf.out_ext = ""
         elif arg in docconv.available_outputs():
             pf.out_ext = arg
         else:
-            return await cq.answer("That format is not available on this server.", show_alert=True)
+            return await safe_answer(cq, "That format is not available on this server.", alert=True)
         pf.awaiting_custom = False
-        await cq.answer(f"Format: {out_format_label(pf.out_ext, pf.ext)}")
+        await safe_answer(cq, f"Format: {out_format_label(pf.out_ext, pf.ext)}")
     elif action == "split":
-        pf.split_kb = int(arg or 0)
+        try:
+            kb = max(0, int(arg or 0))
+        except ValueError:
+            return await safe_answer(cq, "Bad value.", alert=True)
+        pf.split_kb = kb
         pf.awaiting_custom = False
-        await cq.answer(f"Split: {split_label(pf.split_kb)}")
+        await safe_answer(cq, f"Split: {split_label(pf.split_kb)}")
     elif action == "custom":
         pf.awaiting_custom = True
-        await cq.answer()
+        pf.deadline = time.monotonic() + Config.OPTIONS_TIMEOUT
+        await safe_answer(cq, "Type the size in the chat")
         await safe_edit(
             cq.message,
             options_text(pf) + "\n\n✏️ <b>Send the maximum size per file</b> as a message, e.g. <code>500kb</code>, "
@@ -2649,17 +3098,19 @@ async def cb_options(client: Client, cq: CallbackQuery) -> None:
     elif action == "save":
         db.set_out_format(uid, pf.out_ext)
         db.set_split_kb(uid, pf.split_kb)
-        await cq.answer("Saved as your default ✔", show_alert=False)
+        await safe_answer(cq, "Saved as your default ✔")
     elif action == "start":
-        await cq.answer("Starting…")
+        await safe_answer(cq, "Starting…")
         await start_job(pf)
         return
     elif action == "cancel":
         _discard_pending(pf)
         shutil.rmtree(pf.path.parent, ignore_errors=True)
-        await cq.answer("Cancelled")
+        await safe_answer(cq, "Cancelled")
         await safe_edit(cq.message, "🚫 <b>Cancelled.</b> Send another file whenever you like.")
         return
+    else:
+        return await safe_answer(cq, "Unknown action.", alert=True)
     await safe_edit(cq.message, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
 
 
@@ -2668,46 +3119,50 @@ async def handle_custom_size(message: Message, kb: Optional[int]) -> bool:
     uid = message.from_user.id
     pf = pending_files.get(uid)
     if pf and pf.awaiting_custom:
-        if kb is None:
-            await message.reply_text("⚠️ Please send a size like <code>500kb</code> or <code>25mb</code> (or <code>0</code> for no split).")
+        err = _validate_split(kb)
+        if err:
+            pf.deadline = time.monotonic() + Config.OPTIONS_TIMEOUT
+            await safe_reply(message, err)
             return True
-        if kb and kb < Config.SPLIT_MIN_KB:
-            await message.reply_text(f"⚠️ Minimum split size is {Config.SPLIT_MIN_KB} KB.")
-            return True
-        if kb > Config.TG_MAX_FILE_MB * 1024:
-            await message.reply_text(f"⚠️ Telegram files can't exceed {Config.TG_MAX_FILE_MB} MB.")
-            return True
-        pf.split_kb = kb
+        pf.split_kb = kb or 0
         pf.awaiting_custom = False
+        pf.deadline = time.monotonic() + Config.OPTIONS_TIMEOUT
         await safe_edit(pf.status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
-        await message.reply_text(f"✂️ Split set: <b>{split_label(kb)}</b> — tap ▶️ Start on the panel above.")
+        await safe_reply(
+            message,
+            f"✂️ Split set: <b>{split_label(pf.split_kb)}</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start translation", callback_data="opt:start")]]),
+        )
         return True
-    mode = pending_input.get(uid)
-    if mode == "set_custom":
-        pending_input.pop(uid, None)
-        if kb is None or (kb and kb < Config.SPLIT_MIN_KB) or kb > Config.TG_MAX_FILE_MB * 1024:
-            await message.reply_text(f"⚠️ Please send a size between {Config.SPLIT_MIN_KB} KB and {Config.TG_MAX_FILE_MB} MB, e.g. <code>25mb</code> (or <code>0</code>).")
+    if pending_input.get(uid) == "set_custom":
+        err = _validate_split(kb)
+        if err:
+            await safe_reply(message, err + " Or tap ✖ Close on the settings panel to stop.")
             return True
-        db.set_split_kb(uid, kb)
+        pending_input.pop(uid, None)
+        db.set_split_kb(uid, kb or 0)
         row = db.get_user(uid)
-        await message.reply_text(settings_text(row), reply_markup=options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
+        await safe_reply(message, settings_text(row), reply_markup=settings_kb_for(row))
         return True
     return False
 
 
 # ── /settings ──────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command(["settings", "output", "format", "split"]) | filters.regex(f"^{re.escape(BTN_SETTINGS)}$")))
+@app.on_message(filters.private & (filters.command(["settings", "output", "format", "split"]) | btn(BTN_SETTINGS)))
+@guarded
 async def cmd_settings(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    await message.reply_text(settings_text(row), reply_markup=options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
+    clear_set_custom(message.from_user.id)
+    await safe_reply(message, settings_text(row), reply_markup=settings_kb_for(row))
 
 
 @app.on_callback_query(filters.regex(r"^set:(\w+)(?::(.+))?$"))
+@guarded
 async def cb_settings(client: Client, cq: CallbackQuery) -> None:
     uid = cq.from_user.id
-    db.upsert_user(uid, cq.from_user.first_name or "", cq.from_user.username)
+    await cq_user(cq)
     action, arg = cq.matches[0].group(1), cq.matches[0].group(2) or ""
     if action == "fmt":
         if arg == "same":
@@ -2715,32 +3170,48 @@ async def cb_settings(client: Client, cq: CallbackQuery) -> None:
         elif arg in docconv.available_outputs():
             db.set_out_format(uid, arg)
         else:
-            return await cq.answer("That format is not available on this server.", show_alert=True)
-        await cq.answer("Default format saved")
+            return await safe_answer(cq, "That format is not available on this server.", alert=True)
+        clear_set_custom(uid)
+        await safe_answer(cq, "Default format saved")
     elif action == "split":
-        db.set_split_kb(uid, int(arg or 0))
-        await cq.answer("Default split saved")
+        try:
+            db.set_split_kb(uid, max(0, int(arg or 0)))
+        except ValueError:
+            return await safe_answer(cq, "Bad value.", alert=True)
+        clear_set_custom(uid)
+        await safe_answer(cq, "Default split saved")
     elif action == "custom":
         pending_input[uid] = "set_custom"
-        await cq.answer()
-        await cq.message.reply_text(
-            f"✏️ Send the default maximum size per file, e.g. <code>500kb</code>, <code>25mb</code> "
-            f"(min {Config.SPLIT_MIN_KB} KB, max {Config.TG_MAX_FILE_MB} MB). Send <code>0</code> for no split."
-        )
+        await safe_answer(cq, "Type the size in the chat")
+        if cq.message:
+            await safe_send(
+                client,
+                cq.message.chat.id,
+                f"✏️ Send the default maximum size per file, e.g. <code>500kb</code>, <code>25mb</code> "
+                f"(min {Config.SPLIT_MIN_KB} KB, max {Config.TG_MAX_FILE_MB} MB). Send <code>0</code> for no split.",
+            )
         return
     elif action == "ask":
         row = db.get_user(uid)
-        db.set_ask_options(uid, not bool(row["ask_options"]))
-        await cq.answer("Toggled")
+        new = not _ask_on(row)
+        db.set_ask_options(uid, new)
+        await safe_answer(cq, "Will ask before every file" if new else "Files start immediately with these defaults")
+    elif action == "reset":
+        db.set_out_format(uid, "")
+        db.set_split_kb(uid, 0)
+        db.set_ask_options(uid, True)
+        clear_set_custom(uid)
+        await safe_answer(cq, "Defaults restored")
     elif action == "close":
-        await cq.answer()
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
+        clear_set_custom(uid)
+        await safe_answer(cq)
+        if not await safe_delete(cq.message):
+            await safe_edit(cq.message, "✖ Closed.")
         return
+    else:
+        return await safe_answer(cq, "Unknown action.", alert=True)
     row = db.get_user(uid)
-    await safe_edit(cq.message, settings_text(row), options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
+    await safe_edit(cq.message, settings_text(row), settings_kb_for(row))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2767,36 +3238,59 @@ def admin_text() -> str:
     )
 
 
-@app.on_message(admin_filter & (filters.command("admin") | filters.regex(f"^{re.escape(BTN_ADMIN)}$")))
+@app.on_message(admin_filter & (filters.command("admin") | btn(BTN_ADMIN)))
+@guarded
 async def cmd_admin(client: Client, message: Message) -> None:
-    await message.reply_text(admin_text(), reply_markup=admin_kb())
+    await safe_reply(message, admin_text(), reply_markup=admin_kb())
+
+
+# non-admins tapping a cached "🛠 Admin" button must get *some* answer
+@app.on_message(filters.private & ~admin_filter & (filters.command("admin") | btn(BTN_ADMIN)))
+@guarded
+async def cmd_admin_denied(client: Client, message: Message) -> None:
+    if not message.from_user:
+        return
+    await safe_reply(message, "🔒 This section is for admins only.", reply_markup=main_kb(message.from_user.id))
+
+
+def _back_kb(target: str = "adm:menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=target), close_btn("adm:close")]])
+
+
+# health check may take up to 75 s — never run two at once from button spam
+_health_lock = asyncio.Lock()
 
 
 @app.on_callback_query(filters.regex(r"^adm:(\w+)$"))
+@guarded
 async def cb_admin(client: Client, cq: CallbackQuery) -> None:
     if not Config.is_admin(cq.from_user.id):
-        return await cq.answer("Admins only.", show_alert=True)
+        return await safe_answer(cq, "Admins only.", alert=True)
     action = cq.matches[0].group(1)
-    back = InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="adm:menu")]])
-    toast, alert, answered = "", False, False
     if action == "menu":
+        await safe_answer(cq)
         await safe_edit(cq.message, admin_text(), admin_kb())
     elif action == "close":
-        await cq.message.delete()
+        pending_input.pop(cq.from_user.id, None)
+        await safe_answer(cq)
+        if not await safe_delete(cq.message):
+            await safe_edit(cq.message, "✖ Closed.")
     elif action == "workers":
+        await safe_answer(cq)
         await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n" + pool.summary(), workers_kb())
     elif action == "health":
         # answer *before* pinging: a ping may take up to 75 s and Telegram only
         # accepts a callback answer for ~15 s (otherwise the button spins forever)
-        answered = True
-        try:
-            await cq.answer("Pinging workers…")
-        except Exception:
-            pass
-        if jobs.session:
-            await pool.health_check(jobs.session)
+        if _health_lock.locked():
+            return await safe_answer(cq, "A health check is already running…")
+        await safe_answer(cq, "Pinging workers…")
+        await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n⏳ Pinging every worker (up to ~75 s)…", _back_kb())
+        async with _health_lock:
+            if jobs.session:
+                await pool.health_check(jobs.session)
         await safe_edit(cq.message, "🖥 <b>Workers</b> (fresh check)\n\n" + pool.summary(), workers_kb())
     elif action == "stats":
+        await safe_answer(cq)
         s = db.stats()
         await safe_edit(
             cq.message,
@@ -2807,237 +3301,334 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
             f"🔤 Characters translated: {s['chars']:,}\n\n"
             f"💰 Payments: {s['payments']} · Revenue: ₹{s['revenue']:,}\n"
             f"🎟 Unused credits (all users): {s['credits_out']}",
-            back,
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="adm:stats")], [InlineKeyboardButton("« Back", callback_data="adm:menu"), close_btn("adm:close")]]),
         )
     elif action == "queue":
+        await safe_answer(cq)
         lines = []
         ordered = sorted(jobs.jobs.values(), key=lambda j: (j.id not in jobs.running, j.priority, j.created))
+        rows: List[List[InlineKeyboardButton]] = []
         for j in ordered[:40]:
             state = "⚙️" if j.id in jobs.running else "⏳"
             lines.append(f"{state} #{j.id} · <code>{j.user_id}</code> · {html.escape(j.file_name[:30])} → {j.lang}")
+        for j in ordered[:6]:
+            rows.append([InlineKeyboardButton(f"🚫 Cancel #{j.id}", callback_data=f"cancel:{j.id}")])
         if len(ordered) > 40:
             lines.append(f"… and {len(ordered) - 40} more")
-        await safe_edit(cq.message, "📋 <b>Queue</b>\n\n" + ("\n".join(lines) or "Empty."), back)
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="adm:queue")])
+        rows.append([InlineKeyboardButton("« Back", callback_data="adm:menu"), close_btn("adm:close")])
+        await safe_edit(cq.message, "📋 <b>Queue</b>\n\n" + ("\n".join(lines) or "Empty."), InlineKeyboardMarkup(rows))
     elif action == "clear":
         n = jobs.clear_stuck()
-        toast, alert = f"Cancelled {n} running job(s).", True
+        await safe_answer(cq, f"Cancelled {n} running job(s).", alert=True)
         await safe_edit(cq.message, admin_text(), admin_kb())
     elif action == "bcast":
         pending_input[cq.from_user.id] = "broadcast"
-        await safe_edit(cq.message, "📣 Send the broadcast message now (text/photo). Send /cancel_input to abort.", back)
-    if answered:
-        return
-    try:
-        await cq.answer(toast, show_alert=alert)
-    except Exception:
-        pass
+        await safe_answer(cq)
+        await safe_edit(
+            cq.message,
+            "📣 Send the broadcast message now (text / photo / document). It will be copied to every user.\n"
+            "Tap <b>Abort</b> or send /cancel_input to stop.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("✖ Abort", callback_data="adm:abort")]]),
+        )
+    elif action == "abort":
+        pending_input.pop(cq.from_user.id, None)
+        await safe_answer(cq, "Aborted")
+        await safe_edit(cq.message, admin_text(), admin_kb())
+    else:
+        await safe_answer(cq, "Unknown action.", alert=True)
 
 
-@app.on_callback_query(filters.regex(r"^wrk:(\w+)(?::(\d+))?$"))
+@app.on_callback_query(filters.regex(r"^wrk:(\w+)(?::(\w+))?$"))
+@guarded
 async def cb_workers(client: Client, cq: CallbackQuery) -> None:
     if not Config.is_admin(cq.from_user.id):
-        return await cq.answer("Admins only.", show_alert=True)
-    action, idx = cq.matches[0].group(1), cq.matches[0].group(2)
-    urls = list(pool.workers)
+        return await safe_answer(cq, "Admins only.", alert=True)
+    action, wid = cq.matches[0].group(1), cq.matches[0].group(2)
     if action == "add":
         pending_input[cq.from_user.id] = "add_worker"
-        await safe_edit(cq.message, "➕ Send the worker URL, e.g.\n<code>https://user-space.hf.space</code>\n<code>https://user.pythonanywhere.com</code>\n<code>https://proj.vercel.app</code>\n<code>https://xyz.onrender.com</code>\nSend /cancel_input to abort.")
-        return await cq.answer()
-    if idx is None or int(idx) >= len(urls):
-        return await cq.answer("Worker not found.", show_alert=True)
-    url = urls[int(idx)]
+        await safe_answer(cq)
+        await safe_edit(
+            cq.message,
+            "➕ Send the worker URL(s), e.g.\n<code>https://user-space.hf.space</code>\n<code>https://user.pythonanywhere.com</code>\n"
+            "<code>https://proj.vercel.app</code>\n<code>https://xyz.onrender.com</code>\n\nTap <b>Abort</b> or send /cancel_input to stop.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("✖ Abort", callback_data="wrk:abort")]]),
+        )
+        return
+    if action == "abort":
+        pending_input.pop(cq.from_user.id, None)
+        await safe_answer(cq, "Aborted")
+        await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n" + pool.summary(), workers_kb())
+        return
+    w = worker_by_id(wid or "")
+    if w is None:
+        await safe_answer(cq, "Worker not found (list changed) — refreshed.", alert=True)
+        await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n" + pool.summary(), workers_kb())
+        return
     if action == "toggle":
-        pool.toggle(url)
+        pool.toggle(w.url)
+        await safe_answer(cq, "Worker enabled" if pool.workers.get(w.url, w).enabled else "Worker paused")
     elif action == "del":
-        pool.remove(url)
-    await cq.answer("Done")
+        pool.remove(w.url)
+        await safe_answer(cq, "Worker removed")
+    else:
+        return await safe_answer(cq, "Unknown action.", alert=True)
     await safe_edit(cq.message, "🖥 <b>Workers</b>\n\n" + pool.summary(), workers_kb())
 
 
+def _arg_int(message: Message, i: int, default: Optional[int] = None) -> Optional[int]:
+    """message.command[i] as int, or default (None → missing/invalid)."""
+    try:
+        return int(message.command[i])
+    except (IndexError, ValueError, AttributeError):
+        return default
+
+
 @app.on_message(admin_filter & filters.command("addworker"))
+@guarded
 async def cmd_addworker(client: Client, message: Message) -> None:
     pending_input.pop(message.from_user.id, None)
     if len(message.command) < 2:
-        return await message.reply_text("Usage: <code>/addworker https://user-space.hf.space [more URLs…]</code>")
-    added = [u for u in message.command[1:] if pool.add(u)]
+        return await safe_reply(message, "Usage: <code>/addworker https://user-space.hf.space [more URLs…]</code>")
+    urls = message.command[1:]
+    added = [u for u in urls if pool.add(u)]
+    bad = [u for u in urls if not pool.is_valid(pool.normalize(u))]
     if jobs.session and added:
         await pool.health_check(jobs.session)
-    await message.reply_text(f"✅ Added {len(added)} worker(s).\n\n" + pool.summary())
+    note = f"\n⚠️ Ignored invalid: {html.escape(', '.join(bad))}" if bad else ""
+    await safe_reply(message, f"✅ Added {len(added)} worker(s).{note}\n\n" + pool.summary(), reply_markup=workers_kb())
 
 
 @app.on_message(admin_filter & filters.command("delworker"))
+@guarded
 async def cmd_delworker(client: Client, message: Message) -> None:
     if len(message.command) < 2:
-        return await message.reply_text("Usage: <code>/delworker URL</code>")
+        return await safe_reply(message, "Usage: <code>/delworker URL</code>")
     ok = pool.remove(pool.normalize(message.command[1]))
-    await message.reply_text("✅ Removed." if ok else "⚠️ Not found.")
+    await safe_reply(message, "✅ Removed." if ok else "⚠️ Not found.", reply_markup=workers_kb())
 
 
 @app.on_message(admin_filter & filters.command("addpremium"))
+@guarded
 async def cmd_addpremium(client: Client, message: Message) -> None:
-    try:
-        uid = int(message.command[1])
-        days = int(message.command[2]) if len(message.command) > 2 else Config.PREMIUM_DAYS
-    except (IndexError, ValueError):
-        return await message.reply_text("Usage: <code>/addpremium USER_ID [days]</code>")
+    uid = _arg_int(message, 1)
+    days = _arg_int(message, 2, Config.PREMIUM_DAYS)
+    if uid is None or days is None or days <= 0:
+        return await safe_reply(message, "Usage: <code>/addpremium USER_ID [days]</code>")
     until = db.add_premium(uid, days)
-    await message.reply_text(f"⭐ Premium for <code>{uid}</code> till {fmt_dt(until)}.")
-    try:
-        await client.send_message(uid, f"🎉 <b>Premium activated!</b> Valid till <b>{fmt_dt(until)}</b>.")
-    except Exception:
-        pass
+    await safe_reply(message, f"⭐ Premium for <code>{uid}</code> till {fmt_dt(until)}.")
+    await safe_send(client, uid, f"🎉 <b>Premium activated!</b> Valid till <b>{fmt_dt(until)}</b>.")
 
 
 @app.on_message(admin_filter & filters.command("addplan"))
+@guarded
 async def cmd_addplan(client: Client, message: Message) -> None:
     """/addplan USER_ID PLAN_KEY [days|credits] — grant any catalogue plan manually."""
-    try:
-        uid = int(message.command[1])
-        plan = PLANS[message.command[2].lower()]
-        amount = int(message.command[3]) if len(message.command) > 3 else 0
-    except (IndexError, ValueError, KeyError):
-        return await message.reply_text(
+    uid = _arg_int(message, 1)
+    plan = PLANS.get(message.command[2].lower()) if len(message.command) > 2 else None
+    amount = _arg_int(message, 3, 0)
+    if uid is None or plan is None or amount is None or amount < 0:
+        return await safe_reply(
+            message,
             "Usage: <code>/addplan USER_ID PLAN [days|credits]</code>\n"
-            f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}"
+            f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}",
         )
     if plan.is_sub:
         until = db.add_subscription(uid, plan.key, amount or plan.days)
-        await message.reply_text(f"{plan.emoji} {plan.title} for <code>{uid}</code> till {fmt_dt(until)}.")
+        await safe_reply(message, f"{plan.emoji} {plan.title} for <code>{uid}</code> till {fmt_dt(until)}.")
         note = f"🎉 <b>{plan.emoji} {plan.title} activated!</b> Valid till <b>{fmt_dt(until)}</b>."
     else:
         n = amount or plan.credits
         total = db.add_credits(uid, n)
-        await message.reply_text(f"{plan.emoji} +{n} credits for <code>{uid}</code> → {total} total.")
+        await safe_reply(message, f"{plan.emoji} +{n} credits for <code>{uid}</code> → {total} total.")
         note = f"🎉 <b>{plan.emoji} {plan.title} activated!</b> +{n} credits → you now have <b>{total}</b>. They never expire."
-    try:
-        await client.send_message(uid, note)
-    except Exception:
-        pass
+    await safe_send(client, uid, note)
 
 
 @app.on_message(admin_filter & filters.command("addcredits"))
+@guarded
 async def cmd_addcredits(client: Client, message: Message) -> None:
     """/addcredits USER_ID N — N may be negative to deduct."""
-    try:
-        uid = int(message.command[1])
-        n = int(message.command[2])
-    except (IndexError, ValueError):
-        return await message.reply_text("Usage: <code>/addcredits USER_ID N</code>")
+    uid, n = _arg_int(message, 1), _arg_int(message, 2)
+    if uid is None or n is None:
+        return await safe_reply(message, "Usage: <code>/addcredits USER_ID N</code>")
     total = db.add_credits(uid, n)
-    await message.reply_text(f"🎟 Credits for <code>{uid}</code>: {n:+d} → <b>{total}</b>.")
+    await safe_reply(message, f"🎟 Credits for <code>{uid}</code>: {n:+d} → <b>{total}</b>.")
     if n > 0:
-        try:
-            await client.send_message(uid, f"🎟 You received <b>{n}</b> file credits → total <b>{total}</b>. They never expire.")
-        except Exception:
-            pass
+        await safe_send(client, uid, f"🎟 You received <b>{n}</b> file credits → total <b>{total}</b>. They never expire.")
 
 
 @app.on_message(admin_filter & filters.command("revoke"))
+@guarded
 async def cmd_revoke(client: Client, message: Message) -> None:
-    try:
-        uid = int(message.command[1])
-    except (IndexError, ValueError):
-        return await message.reply_text("Usage: <code>/revoke USER_ID</code>")
+    uid = _arg_int(message, 1)
+    if uid is None:
+        return await safe_reply(message, "Usage: <code>/revoke USER_ID</code>")
     db.revoke_premium(uid)
-    await message.reply_text(f"Subscription revoked for <code>{uid}</code> (credits untouched — use /addcredits to adjust).")
+    await safe_reply(message, f"Subscription revoked for <code>{uid}</code> (credits untouched — use /addcredits to adjust).")
 
 
 @app.on_message(admin_filter & filters.command(["ban", "unban"]))
+@guarded
 async def cmd_ban(client: Client, message: Message) -> None:
-    try:
-        uid = int(message.command[1])
-    except (IndexError, ValueError):
-        return await message.reply_text(f"Usage: <code>/{message.command[0]} USER_ID</code>")
-    if uid == Config.OWNER_ID:
-        return await message.reply_text("Cannot ban the owner.")
-    ban = message.command[0] == "ban"
+    uid = _arg_int(message, 1)
+    if uid is None:
+        return await safe_reply(message, f"Usage: <code>/{message.command[0]} USER_ID</code>")
+    if uid == Config.OWNER_ID or uid in Config.ADMIN_IDS:
+        return await safe_reply(message, "Cannot ban an admin.")
+    ban = message.command[0].lower() == "ban"
     if db.get_user(uid) is None:
         db.upsert_user(uid, "", None)
     db.set_banned(uid, ban)
-    if ban and uid in jobs.by_user:
-        jobs.cancel(jobs.by_user[uid])
-    await message.reply_text(f"{'🚫 Banned' if ban else '✅ Unbanned'} <code>{uid}</code>.")
+    if ban:
+        # stop everything the user has in flight and free their slot
+        if uid in jobs.by_user:
+            jobs.cancel(jobs.by_user[uid])
+        pf = pending_files.get(uid)
+        if pf:
+            _discard_pending(pf)
+            shutil.rmtree(pf.path.parent, ignore_errors=True)
+            await safe_edit(pf.status, "🚫 <b>Cancelled.</b>")
+    await safe_reply(message, f"{'🚫 Banned' if ban else '✅ Unbanned'} <code>{uid}</code>.")
 
 
 @app.on_message(admin_filter & filters.command("user"))
+@guarded
 async def cmd_user(client: Client, message: Message) -> None:
-    try:
-        uid = int(message.command[1])
-    except (IndexError, ValueError):
-        return await message.reply_text("Usage: <code>/user USER_ID</code>")
+    uid = _arg_int(message, 1)
+    if uid is None:
+        return await safe_reply(message, "Usage: <code>/user USER_ID</code>")
     row = db.get_user(uid)
     if not row:
-        return await message.reply_text("User not found.")
-    await message.reply_text(
+        return await safe_reply(message, "User not found.")
+    state = ""
+    if uid in jobs.by_user:
+        state = f"\n⚙️ Active job #{jobs.by_user[uid]}"
+    elif uid in pending_files:
+        state = "\n⏳ File waiting for options"
+    await safe_reply(
+        message,
         f"👤 <b>{html.escape(row['name'] or '-')}</b> @{row['username'] or '-'} · <code>{uid}</code>\n"
         f"🌐 {lang_name(row['lang'])} · 📚 {row['total_files']} files\n"
         f"💼 {user_line(row)}\n"
-        f"🚫 Banned: {'yes' if row['banned'] else 'no'} · joined {fmt_dt(row['joined'])}"
+        f"🚫 Banned: {'yes' if row['banned'] else 'no'} · joined {fmt_dt(row['joined'])}" + state,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban" if not row["banned"] else "✅ Unban", callback_data=f"usr:{'unban' if row['banned'] else 'ban'}:{uid}")]]),
     )
 
 
+@app.on_callback_query(filters.regex(r"^usr:(ban|unban):(\d+)$"))
+@guarded
+async def cb_user(client: Client, cq: CallbackQuery) -> None:
+    if not Config.is_admin(cq.from_user.id):
+        return await safe_answer(cq, "Admins only.", alert=True)
+    action, uid = cq.matches[0].group(1), int(cq.matches[0].group(2))
+    if uid == Config.OWNER_ID or uid in Config.ADMIN_IDS:
+        return await safe_answer(cq, "Cannot ban an admin.", alert=True)
+    ban = action == "ban"
+    if db.get_user(uid) is None:
+        db.upsert_user(uid, "", None)
+    db.set_banned(uid, ban)
+    if ban:
+        if uid in jobs.by_user:
+            jobs.cancel(jobs.by_user[uid])
+        pf = pending_files.get(uid)
+        if pf:
+            _discard_pending(pf)
+            shutil.rmtree(pf.path.parent, ignore_errors=True)
+            await safe_edit(pf.status, "🚫 <b>Cancelled.</b>")
+    await safe_answer(cq, "Banned" if ban else "Unbanned")
+    try:
+        await cq.message.edit_reply_markup(
+            InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unban" if ban else "🚫 Ban", callback_data=f"usr:{'unban' if ban else 'ban'}:{uid}")]])
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_broadcast_running = False
+
+
 async def do_broadcast(client: Client, src: Message, status: Message) -> None:
-    ids = db.all_user_ids()
-    ok = fail = 0
-    for i, uid in enumerate(ids, 1):
-        try:
-            await src.copy(uid)
-            ok += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
+    global _broadcast_running
+    if _broadcast_running:
+        await safe_edit(status, "⚠️ Another broadcast is still running — try again when it finishes.")
+        return
+    _broadcast_running = True
+    try:
+        ids = db.all_user_ids()
+        ok = fail = 0
+        for i, uid in enumerate(ids, 1):
             try:
                 await src.copy(uid)
                 ok += 1
-            except Exception:
+            except FloodWait as e:
+                await asyncio.sleep(min(e.value, 300))
+                try:
+                    await src.copy(uid)
+                    ok += 1
+                except Exception:  # noqa: BLE001
+                    fail += 1
+            except Exception:  # noqa: BLE001
                 fail += 1
-        except Exception:
-            fail += 1
-        if i % 25 == 0:
-            await safe_edit(status, f"📣 Broadcasting… {i}/{len(ids)}")
-        await asyncio.sleep(0.05)
-    await safe_edit(status, f"📣 <b>Broadcast done</b>\n✅ {ok} · ❌ {fail}")
+            if i % 25 == 0:
+                await safe_edit(status, f"📣 Broadcasting… {i}/{len(ids)}")
+            await asyncio.sleep(0.05)
+        await safe_edit(status, f"📣 <b>Broadcast done</b>\n✅ {ok} · ❌ {fail}")
+    except Exception as e:  # noqa: BLE001
+        log.exception("broadcast crashed: %s", e)
+        await safe_edit(status, "❌ Broadcast stopped due to an error — see the log.")
+    finally:
+        _broadcast_running = False
 
 
 @app.on_message(admin_filter & filters.command("broadcast"))
+@guarded
 async def cmd_broadcast(client: Client, message: Message) -> None:
     pending_input.pop(message.from_user.id, None)
     src = message.reply_to_message
     if not src:
         text = (message.text or message.caption or "").split(None, 1)
         if len(text) < 2:
-            return await message.reply_text("Reply to a message with /broadcast, or <code>/broadcast TEXT</code>.")
+            return await safe_reply(message, "Reply to a message with /broadcast, or <code>/broadcast TEXT</code>.")
         try:
             src = await message.reply_text(text[1])
         except Exception:  # invalid HTML in the text → send it verbatim
-            src = await message.reply_text(text[1], parse_mode=ParseMode.DISABLED)
-    status = await message.reply_text("📣 Broadcasting…")
-    asyncio.create_task(do_broadcast(client, src, status))
+            src = await safe_reply(message, text[1], parse_mode=ParseMode.DISABLED)
+        if src is None:
+            return
+    status = await safe_reply(message, "📣 Broadcasting…")
+    if status:
+        asyncio.create_task(do_broadcast(client, src, status))
 
 
 @app.on_message(admin_filter & filters.command("cancel_input"))
+@guarded
 async def cmd_cancel_input(client: Client, message: Message) -> None:
-    pending_input.pop(message.from_user.id, None)
-    await message.reply_text("Input cancelled.")
+    had = pending_input.pop(message.from_user.id, None)
+    await safe_reply(message, "Input cancelled." if had else "Nothing to cancel.")
 
 
 # admin pending-input consumer (must be registered after commands; group=1)
-@app.on_message(admin_filter & ~filters.command(USER_COMMANDS + ["admin", "cancel_input"]), group=1)
+@app.on_message(admin_filter & ~filters.command(KNOWN_COMMANDS), group=1)
+@guarded
 async def on_admin_input(client: Client, message: Message) -> None:
     mode = pending_input.get(message.from_user.id)
-    if not mode or mode == "set_custom":
+    if mode not in ("add_worker", "broadcast"):
         return
     text = message.text or ""
-    if text in ALL_BTNS:
+    if is_menu_button(text):
+        # the admin tapped a menu button instead of answering → forget the prompt
+        pending_input.pop(message.from_user.id, None)
         return
     if text.startswith("/"):
-        # any other command (/addworker, /ban, …) was already handled in group 0;
-        # it must not be swallowed here as a worker URL / broadcast text
+        # any other command was already handled in group 0; it must not be
+        # swallowed here as a worker URL / broadcast text
         pending_input.pop(message.from_user.id, None)
         return
     pending_input.pop(message.from_user.id, None)
     if mode == "add_worker":
         if not text:
-            await message.reply_text("⚠️ Please send the worker URL as text.")
+            await safe_reply(message, "⚠️ Please send the worker URL as text.")
         else:
             urls = text.split()
             added = [u for u in urls if pool.add(u)]
@@ -3045,28 +3636,63 @@ async def on_admin_input(client: Client, message: Message) -> None:
             if jobs.session and added:
                 await pool.health_check(jobs.session)
             note = f"\n⚠️ Ignored invalid: {html.escape(', '.join(bad))}" if bad else ""
-            await message.reply_text(f"✅ Added {len(added)} worker(s).{note}\n\n" + pool.summary(), reply_markup=workers_kb())
+            await safe_reply(message, f"✅ Added {len(added)} worker(s).{note}\n\n" + pool.summary(), reply_markup=workers_kb())
     elif mode == "broadcast":
-        status = await message.reply_text("📣 Broadcasting…")
-        asyncio.create_task(do_broadcast(client, message, status))
+        status = await safe_reply(message, "📣 Broadcasting…")
+        if status:
+            asyncio.create_task(do_broadcast(client, message, status))
     message.stop_propagation()
 
 
 # ── fallback for random text ───────────────────────────────────────────────
-@app.on_message(filters.private & filters.text & ~filters.command(USER_COMMANDS), group=2)
+@app.on_message(filters.private & filters.text & ~filters.command(KNOWN_COMMANDS), group=2)
+@guarded
 async def on_text(client: Client, message: Message) -> None:
-    if message.text in ALL_BTNS or message.text.startswith("/"):
+    if not message.from_user or not message.text:
         return
+    text = message.text.strip()
+    if is_menu_button(text):
+        return  # handled in group 0 (or admin-denied)
+    uid = message.from_user.id
+    if text.startswith("/"):
+        # unknown command — tell the user instead of staying silent
+        if db.is_banned(uid):
+            return
+        return await safe_reply(
+            message,
+            "🤔 Unknown command. Try /help or use the buttons below.",
+            reply_markup=main_kb(uid),
+        )
+    # a custom split size for a waiting file or for /settings?
+    if await handle_custom_size(message, parse_size_kb(text)):
+        return
+    if Config.is_admin(uid) and uid in pending_input:
+        return
+    row = await guard(client, message)
+    if not row:
+        return
+    await safe_reply(
+        message,
+        "📎 Send me a file to translate (<b>EPUB · PDF · DOCX · TXT · HTML</b>), or use the menu below.",
+        reply_markup=main_kb(uid),
+    )
+
+
+# ── anything else (stickers, photos, voice…) ──────────────────────────────
+@app.on_message(filters.private & ~filters.text & ~filters.document & ~filters.service, group=2)
+@guarded
+async def on_other(client: Client, message: Message) -> None:
     if not message.from_user:
         return
-    # a custom split size for a waiting file or for /settings?
-    if await handle_custom_size(message, parse_size_kb(message.text)):
+    uid = message.from_user.id
+    if Config.is_admin(uid) and pending_input.get(uid) == "broadcast":
+        return  # photo broadcast handled in group 1
+    if db.is_banned(uid):
         return
-    if Config.is_admin(message.from_user.id) and message.from_user.id in pending_input:
-        return
-    await message.reply_text(
-        "📎 Send me a file to translate (<b>EPUB · PDF · DOCX · TXT · HTML</b>), or use the menu below.",
-        reply_markup=main_kb(message.from_user.id),
+    await safe_reply(
+        message,
+        "📎 Please send the book as a <b>file/document</b> (EPUB · PDF · DOCX · TXT · HTML) — not as a photo or text.",
+        reply_markup=main_kb(uid),
     )
 
 
@@ -3088,9 +3714,69 @@ async def keep_alive_loop() -> None:
         await asyncio.sleep(Config.WORKER_PING_INTERVAL)
 
 
+def cleanup_on_boot() -> None:
+    """Remove temp dirs and mark jobs that were interrupted by the previous
+    process as failed (their files are gone; users must resend)."""
+    n_dirs = 0
+    try:
+        for d in Config.DATA_DIR.glob("epub_*"):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                n_dirs += 1
+    except Exception as e:  # noqa: BLE001
+        log.warning("temp cleanup failed: %s", e)
+    n_jobs = db.fail_interrupted_jobs()
+    if n_dirs or n_jobs:
+        log.info("boot cleanup: removed %d temp dir(s), marked %d interrupted job(s) failed", n_dirs, n_jobs)
+
+
+async def register_commands() -> None:
+    """Populate the '/' command menu in Telegram (users + richer list for admins)."""
+    user_cmds = [
+        BotCommand("start", "Main menu"),
+        BotCommand("lang", "Choose target language"),
+        BotCommand("settings", "Output format & split size"),
+        BotCommand("status", "Your plan, queue & workers"),
+        BotCommand("plans", "Plans & pricing"),
+        BotCommand("cancel", "Cancel current file"),
+        BotCommand("help", "How it works"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("admin", "Admin panel"),
+        BotCommand("addworker", "Add worker URL(s)"),
+        BotCommand("delworker", "Remove worker URL"),
+        BotCommand("addplan", "Grant plan: USER_ID PLAN [n]"),
+        BotCommand("addcredits", "Give credits: USER_ID N"),
+        BotCommand("user", "Show user: USER_ID"),
+        BotCommand("ban", "Ban USER_ID"),
+        BotCommand("unban", "Unban USER_ID"),
+        BotCommand("broadcast", "Broadcast a message"),
+    ]
+    try:
+        await app.set_bot_commands(user_cmds)
+    except Exception as e:  # noqa: BLE001
+        log.warning("set_bot_commands failed: %s", e)
+    for aid in {Config.OWNER_ID, *Config.ADMIN_IDS} - {0}:
+        try:
+            await app.set_bot_commands(admin_cmds, scope=BotCommandScopeChat(aid))
+        except Exception as e:  # noqa: BLE001
+            log.debug("admin commands for %s failed: %s", aid, e)
+
+
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Never let an unhandled exception in a background task kill the process silently."""
+    exc = context.get("exception")
+    if isinstance(exc, asyncio.CancelledError):
+        return
+    log.error("unhandled asyncio error: %s", context.get("message"), exc_info=exc)
+
+
 async def main() -> None:
+    asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
+    cleanup_on_boot()
     await app.start()
     me = await app.get_me()
+    await register_commands()
     # enough sockets for every job slot to run at full parallelism, keep-alive on
     connector = aiohttp.TCPConnector(
         limit=Config.MAX_PARALLEL_REQUESTS * Config.MAX_CONCURRENT_JOBS + 16,
@@ -3103,17 +3789,30 @@ async def main() -> None:
     tasks += [asyncio.create_task(jobs.worker_loop(app, i + 1)) for i in range(max(1, Config.MAX_CONCURRENT_JOBS))]
     log.info("Bot @%s started · %d workers · %d job slots", me.username, len(pool.workers), Config.MAX_CONCURRENT_JOBS)
     if Config.OWNER_ID:
+        await safe_send(app, Config.OWNER_ID, f"🟢 Bot restarted · {len(pool.available())}/{len(pool.workers)} workers online")
+    try:
+        await idle()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # tell users whose file was waiting/queued that they need to resend
+        for pf in list(pending_files.values()):
+            _discard_pending(pf)
+            shutil.rmtree(pf.path.parent, ignore_errors=True)
+            await safe_edit(pf.status, "🔄 Bot is restarting — please send the file again in a minute.")
+        for job in list(jobs.jobs.values()):
+            await safe_edit(job.status_msg, "🔄 Bot is restarting — please send the file again in a minute.")
         try:
-            await app.send_message(Config.OWNER_ID, f"🟢 Bot restarted · {len(pool.available())}/{len(pool.workers)} workers online")
-        except Exception:
+            if jobs.session:
+                await jobs.session.close()
+        except Exception:  # noqa: BLE001
             pass
-    await idle()
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    await jobs.session.close()
-    await app.stop()
-    log.info("Bot stopped")
+        try:
+            await app.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("Bot stopped")
 
 
 if __name__ == "__main__":
