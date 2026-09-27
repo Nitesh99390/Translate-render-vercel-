@@ -201,13 +201,38 @@ every `WORKER_PING_INTERVAL` seconds to keep sleepy free tiers awake.
 
 | User | Admin |
 |---|---|
-| Minimal keyboard: Language · Premium · Status · Help | Inline panel: Workers · Stats · Queue · Broadcast |
+| Minimal keyboard: Language · Plans · Status · Help | Inline panel: Workers · Stats · Queue · Broadcast |
 | 20 languages, live progress bar + ETA, cancel button | Add / pause / remove workers, health check |
-| Free daily limit, premium (Razorpay auto-verify) | `/addpremium /revoke /ban /unban /user /broadcast` |
+| Free daily limit, 5 paid plans (Razorpay auto-verify) | `/addpremium /addplan /addcredits /revoke /ban /unban /user /broadcast` |
 | Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub |
 | Formats: EPUB, PDF (layout kept, Noto fonts auto-downloaded), DOCX, TXT/MD, HTML | Output is returned in the same format |
 
 All settings via environment variables — see `.env.example`.
+
+## Plans
+
+| Plan | Price | What you get | Max file | Queue |
+|---|---|---|---|---|
+| 🆓 Free | — | 2 files / day | 20 MB | normal |
+| 🎟 Starter Pack | ₹10 | **5 file credits, never expire** | 50 MB | faster |
+| 🎫 Bulk Pack | ₹40 | **25 file credits, never expire** | 50 MB | faster |
+| 🔹 Basic | ₹50 / 30 days | 5 files **every day** | 50 MB | faster |
+| ⭐ Premium | ₹100 / 30 days | unlimited | 200 MB | priority |
+| 👑 Premium 3 Months | ₹250 / 90 days | unlimited | 200 MB | priority |
+
+How entitlements are consumed for each file (`resolve_access`):
+
+1. admin → 2. active subscription while its daily quota lasts → 3. credits → 4. free quota.
+
+* Credits are only spent **after** the daily quota is used up, so they are never wasted,
+  and they are refunded automatically if a job fails or is cancelled.
+* Buying a higher subscription while another is active upgrades immediately and carries
+  the remaining days over; buying a lower one while on Premium never downgrades.
+* Every price / limit / duration is an env var (`STARTER_*`, `BULK_*`, `BASIC_*`,
+  `PREMIUM_*`, `PREMIUM3_*`, `CREDIT_MAX_FILE_MB`), and admins can grant anything
+  manually: `/addplan USER_ID basic`, `/addplan USER_ID starter`, `/addcredits USER_ID 10`.
+* Existing databases are migrated on start-up (new `plan` / `credits` columns; old
+  Premium users are mapped to the `premium` plan).
 
 ## Supported formats
 
