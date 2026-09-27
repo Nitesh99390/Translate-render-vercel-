@@ -246,6 +246,32 @@ How entitlements are consumed for each file (`resolve_access`):
 
 Fonts for PDF output are fetched from Google Noto on first use and cached in `DATA_DIR/fonts`.
 
+## Output format & splitting
+
+After a file is translated the user can get it back **in a different format** and/or
+**cut into several files of a maximum size** (`docconv.py`):
+
+* **Format** — any input (EPUB · PDF · DOCX · TXT/MD · HTML) → **EPUB · PDF · DOCX · TXT · HTML**.
+  Conversion goes through a small intermediate model (chapters → XHTML fragments + image
+  store), so headings, bold/italic, lists, tables, links and images survive where the target
+  format allows it. "Same as input" is the default and skips conversion entirely.
+* **Split** — parts are *native* files of the same format, each ≤ the chosen size:
+  EPUB by chapters (cover + TOC only in part 1, long chapters cut at paragraph level),
+  PDF by page ranges (bookmarks re-based), DOCX by body paragraphs (styles/headers kept),
+  HTML by body children, TXT by lines. Parts are named `book (part 2 of 5).epub`.
+  Presets come from `SPLIT_PRESETS_MB`; users can also type a custom size (`500kb`,
+  `25mb`, `1.5gb`; minimum `SPLIT_MIN_KB`, maximum `TG_MAX_FILE_MB`).
+* **How it is asked** — after each upload a panel shows the format/split buttons and
+  ▶️ *Start*; it auto-starts with the defaults after `OPTIONS_TIMEOUT` seconds.
+  `/settings` (⚙️ Output button) stores per-user defaults and can switch the panel off
+  (`Ask for every file: OFF`) so files start immediately. `/cancel` also discards a file
+  waiting on the panel.
+* If a conversion or split fails the original translated file is still delivered with a
+  short ℹ️ note in the caption — nothing is lost.
+
+`python tests/make_fixtures.py && python tests/test_docconv.py` exercises every input → every
+output plus splitting for all five formats.
+
 ## Performance
 
 The master fans a book out to **all workers and Google directly at the same time**:
