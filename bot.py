@@ -80,6 +80,8 @@ try:
 except Exception:  # pragma: no cover
     pymupdf = None
 
+import docconv  # output-format conversion + size splitting (same repo)
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -177,6 +179,15 @@ class Config:
     LOG_PATH = DATA_DIR / "bot.log"
     SESSION_NAME = _env("SESSION_NAME", "translator_bot")
     DEFAULT_LANG = _env("DEFAULT_LANG", "hi")
+
+    # ── output options ─────────────────────────────────────────────────
+    # Preset split sizes (MB) offered as buttons; 0 = "no split" is always there.
+    SPLIT_PRESETS_MB = [int(x) for x in _env("SPLIT_PRESETS_MB", "10,20,50").split(",") if x.strip().isdigit()] or [10, 20, 50]
+    # Smallest custom split a user may ask for (KB) and Telegram's per-file cap (MB).
+    SPLIT_MIN_KB = _env_int("SPLIT_MIN_KB", 512)
+    TG_MAX_FILE_MB = _env_int("TG_MAX_FILE_MB", 2000)
+    # Seconds the "choose output" panel waits before starting with the defaults.
+    OPTIONS_TIMEOUT = _env_int("OPTIONS_TIMEOUT", 90)
 
     @classmethod
     def validate(cls) -> None:
@@ -376,6 +387,12 @@ class Database:
             self._add_column("users", "credits", "INTEGER DEFAULT 0")     # never-expiring file credits
             self._add_column("payments", "plan", "TEXT DEFAULT ''")
             self._add_column("payments", "units", "INTEGER DEFAULT 0")     # credits bought (credit packs)
+            # output preferences: '' = same format as input · split_kb 0 = don't split
+            self._add_column("users", "out_format", "TEXT DEFAULT ''")
+            self._add_column("users", "split_kb", "INTEGER DEFAULT 0")
+            self._add_column("users", "ask_options", "INTEGER DEFAULT 1")   # show the options panel per file
+            self._add_column("jobs", "out_format", "TEXT DEFAULT ''")
+            self._add_column("jobs", "parts", "INTEGER DEFAULT 1")
             # old rows with a live premium_until but no plan key → they bought the old Premium
             self._con.execute(
                 "UPDATE users SET plan='premium' WHERE (plan='' OR plan IS NULL) AND premium_until>?",
@@ -417,6 +434,16 @@ class Database:
 
     def set_lang(self, uid: int, lang: str) -> None:
         self._exec("UPDATE users SET lang=? WHERE id=?", (lang, uid))
+
+    # ── output preferences ─────────────────────────────────────────────────
+    def set_out_format(self, uid: int, ext: str) -> None:
+        self._exec("UPDATE users SET out_format=? WHERE id=?", (ext, uid))
+
+    def set_split_kb(self, uid: int, kb: int) -> None:
+        self._exec("UPDATE users SET split_kb=? WHERE id=?", (max(0, int(kb)), uid))
+
+    def set_ask_options(self, uid: int, ask: bool) -> None:
+        self._exec("UPDATE users SET ask_options=? WHERE id=?", (1 if ask else 0, uid))
 
     def _ensure_user(self, uid: int) -> None:
         if self.get_user(uid) is None:
@@ -575,10 +602,10 @@ class Database:
             )
             return int(cur.lastrowid)
 
-    def finish_job(self, job_id: int, status: str, segments: int = 0, chars: int = 0, seconds: float = 0) -> None:
+    def finish_job(self, job_id: int, status: str, segments: int = 0, chars: int = 0, seconds: float = 0, out_format: str = "", parts: int = 1) -> None:
         self._exec(
-            "UPDATE jobs SET status=?, segments=?, chars=?, seconds=? WHERE id=?",
-            (status, segments, chars, round(seconds, 1), job_id),
+            "UPDATE jobs SET status=?, segments=?, chars=?, seconds=?, out_format=?, parts=? WHERE id=?",
+            (status, segments, chars, round(seconds, 1), out_format, parts, job_id),
         )
 
 
@@ -1596,6 +1623,8 @@ class Job:
     task: Optional[asyncio.Task] = field(default=None, compare=False)
     credit: bool = field(default=False, compare=False)   # paid with a never-expiring credit
     credit_settled: bool = field(default=False, compare=False)  # credit consumed for real (job done)
+    out_ext: str = field(default="", compare=False)      # '' → same as input, else '.pdf' / '.epub' …
+    split_kb: int = field(default=0, compare=False)      # 0 → single file, else max KB per part
 
 
 class JobQueue:
@@ -1731,25 +1760,71 @@ class JobQueue:
 
         await safe_edit(job.status_msg, f"🔍 <b>Analysing {fmt_label}…</b>\n📄 {html.escape(job.file_name)}", cancel_kb(job.id))
         await epub.translate(job.file_path, out_path, progress)
-
         elapsed = time.monotonic() - t0
-        await safe_edit(job.status_msg, "📤 <b>Uploading translated file…</b>")
-        caption = (
+
+        # ── output format conversion ──
+        notes: List[str] = []
+        final_path = out_path
+        out_ext = job.out_ext if job.out_ext and not docconv.same_kind(job.out_ext, job.ext) else ""
+        if out_ext:
+            await safe_edit(job.status_msg, f"🔄 <b>Converting to {docconv.label_of(out_ext)}…</b>\n📄 {html.escape(job.file_name)}")
+            final_path = out_path.with_suffix(out_ext)
+            font = await ensure_pdf_font(self.session, job.lang) if out_ext == ".pdf" else None
+            try:
+                notes += await asyncio.to_thread(docconv.convert, out_path, final_path, font, job.lang)
+            except docconv.ConvertError as e:
+                log.warning("job %d: conversion to %s failed: %s", job.id, out_ext, e)
+                notes.append(f"could not convert to {docconv.label_of(out_ext)} ({e}); sent in original format")
+                final_path = out_path
+                out_ext = ""
+
+        # ── splitting ──
+        parts = [final_path]
+        if job.split_kb > 0:
+            limit = job.split_kb * 1024
+            if final_path.stat().st_size > limit:
+                await safe_edit(job.status_msg, f"✂️ <b>Splitting into ≤ {docconv.fmt_size(limit)} parts…</b>\n📄 {html.escape(job.file_name)}")
+                try:
+                    parts = await asyncio.to_thread(docconv.split_file, final_path, limit)
+                except docconv.ConvertError as e:
+                    log.warning("job %d: split failed: %s", job.id, e)
+                    notes.append(f"could not split ({e}); sent as one file")
+                    parts = [final_path]
+
+        # ── upload ──
+        n = len(parts)
+        await safe_edit(job.status_msg, f"📤 <b>Uploading {n} file{'s' if n > 1 else ''}…</b>")
+        fmt_out = docconv.label_of(final_path.suffix)
+        base_caption = (
             f"✅ <b>Translation complete</b>\n"
-            f"📄 {html.escape(job.file_name)}\n"
+            f"📄 {html.escape(job.file_name)}" + (f" → <b>{fmt_out}</b>" if out_ext else "") + "\n"
             f"🌐 {lang_name(job.lang)} · {epub.segments:,} segments · {epub.chars:,} chars\n"
             f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s · {int(epub.chars / max(elapsed, 1) / 1000)}k chars/s"
         )
-        try:
-            await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await app.send_document(job.chat_id, str(out_path), caption=caption, file_name=out_path.name)
+        if notes:
+            base_caption += "\nℹ️ " + "; ".join(html.escape(x) for x in notes)
+        for i, part in enumerate(parts, 1):
+            caption = base_caption if n == 1 else f"📦 <b>Part {i} of {n}</b> · {docconv.fmt_size(part.stat().st_size)}\n" + base_caption
+            if len(caption) > 1024:
+                caption = caption[:1000] + "…"
+            for attempt in range(3):
+                try:
+                    await app.send_document(job.chat_id, str(part), caption=caption, file_name=part.name)
+                    break
+                except FloodWait as e:
+                    await asyncio.sleep(min(e.value, 120))
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 2:
+                        raise
+                    log.warning("job %d: upload part %d failed (%s), retrying", job.id, i, e)
+                    await asyncio.sleep(3)
+            if n > 1:
+                await safe_edit(job.status_msg, f"📤 <b>Uploading…</b> {i}/{n}")
         try:
             await job.status_msg.delete()
         except Exception:
             pass
-        db.finish_job(job.id, "done", epub.segments, epub.chars, elapsed)
+        db.finish_job(job.id, "done", epub.segments, epub.chars, elapsed, final_path.suffix, n)
         job.credit_settled = True  # keep the credit; don't refund in _cleanup
         db.record_usage(job.user_id, count_daily=not job.credit)
         log.info("job %d done: user=%d file=%s %.1fs", job.id, job.user_id, job.file_name, elapsed)
@@ -1812,10 +1887,13 @@ BTN_PREMIUM_OLD = "⭐ Premium"   # label from older keyboards still cached on u
 BTN_STATUS = "📊 Status"
 BTN_HELP = "❓ Help"
 BTN_ADMIN = "🛠 Admin"
+BTN_SETTINGS = "⚙️ Output"
+ALL_BTNS = (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN, BTN_SETTINGS)
+USER_COMMANDS = ["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
 
 
 def main_kb(uid: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(BTN_LANG), KeyboardButton(BTN_PREMIUM)], [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)]]
+    rows = [[KeyboardButton(BTN_LANG), KeyboardButton(BTN_SETTINGS)], [KeyboardButton(BTN_PREMIUM), KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_HELP)]]
     if Config.is_admin(uid):
         rows.append([KeyboardButton(BTN_ADMIN)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -1974,6 +2052,110 @@ pending_input: Dict[int, str] = {}
 # users whose file is currently being downloaded (slot reserved, job not yet queued)
 downloading: set = set()
 
+
+# ── output options (format + split) ────────────────────────────────────────
+@dataclass
+class PendingFile:
+    """A downloaded file waiting for the user to confirm output options."""
+    uid: int
+    chat_id: int
+    path: Path
+    name: str
+    ext: str
+    lang: str
+    status: Message
+    out_ext: str = ""          # '' = same as input
+    split_kb: int = 0
+    awaiting_custom: bool = False
+    timer: Optional[asyncio.Task] = None
+
+
+pending_files: Dict[int, PendingFile] = {}
+
+_SIZE_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*(kb|k|mb|m|gb|g)?\s*$", re.I)
+
+
+def parse_size_kb(text: str) -> Optional[int]:
+    """'500kb' / '25 MB' / '1.5g' / '20' (MB) → KB, or None if unparseable."""
+    m = _SIZE_RE.match(text or "")
+    if not m:
+        return None
+    num = float(m.group(1).replace(",", "."))
+    unit = (m.group(2) or "mb").lower()[0]
+    mult = {"k": 1, "m": 1024, "g": 1024 * 1024}[unit]
+    return int(num * mult)
+
+
+def fmt_kb(kb: int) -> str:
+    return docconv.fmt_size(kb * 1024)
+
+
+def out_format_label(out_ext: str, in_ext: str = "") -> str:
+    if not out_ext or (in_ext and docconv.same_kind(out_ext, in_ext)):
+        return f"{docconv.label_of(in_ext)} (same as input)" if in_ext else "same as input"
+    return docconv.label_of(out_ext)
+
+
+def split_label(kb: int) -> str:
+    return "no split" if kb <= 0 else f"≤ {fmt_kb(kb)} per file"
+
+
+def options_kb(prefix: str, out_ext: str, split_kb: int, in_ext: str = "", ask: Optional[bool] = None) -> InlineKeyboardMarkup:
+    """Shared keyboard for the per-file panel (prefix 'opt') and /settings ('set')."""
+    fmts = docconv.available_outputs()
+    row: List[InlineKeyboardButton] = []
+    rows: List[List[InlineKeyboardButton]] = []
+    same_sel = not out_ext or (in_ext and docconv.same_kind(out_ext, in_ext))
+    rows.append([InlineKeyboardButton(("✅ " if same_sel else "") + "📄 Same as input", callback_data=f"{prefix}:fmt:same")])
+    for ext in fmts:
+        sel = bool(out_ext) and not same_sel and docconv.same_kind(ext, out_ext)
+        row.append(InlineKeyboardButton(("✅ " if sel else "") + docconv.label_of(ext), callback_data=f"{prefix}:fmt:{ext}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    srow = [InlineKeyboardButton(("✅ " if split_kb <= 0 else "") + "✂️ No split", callback_data=f"{prefix}:split:0")]
+    for mb in Config.SPLIT_PRESETS_MB:
+        kb = mb * 1024
+        srow.append(InlineKeyboardButton(("✅ " if split_kb == kb else "") + f"{mb} MB", callback_data=f"{prefix}:split:{kb}"))
+    rows.append(srow[:2])
+    custom_sel = split_kb > 0 and split_kb not in {mb * 1024 for mb in Config.SPLIT_PRESETS_MB}
+    rows.append(srow[2:] + [InlineKeyboardButton(("✅ " if custom_sel else "") + "✏️ Custom…", callback_data=f"{prefix}:custom")])
+    if prefix == "opt":
+        rows.append([InlineKeyboardButton("▶️ Start translation", callback_data="opt:start")])
+        rows.append([InlineKeyboardButton("💾 Save as default", callback_data="opt:save"), InlineKeyboardButton("🚫 Cancel", callback_data="opt:cancel")])
+    else:
+        rows.append([InlineKeyboardButton(f"💬 Ask for every file: {'ON' if ask else 'OFF'}", callback_data="set:ask")])
+        rows.append([InlineKeyboardButton("✖ Close", callback_data="set:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def options_text(pf: PendingFile) -> str:
+    size = pf.path.stat().st_size if pf.path.exists() else 0
+    return (
+        "⚙️ <b>Output options</b>\n"
+        f"📄 {html.escape(pf.name)} · {docconv.fmt_size(size)}\n"
+        f"🌐 → {lang_name(pf.lang)}\n\n"
+        f"📤 Format: <b>{out_format_label(pf.out_ext, pf.ext)}</b>\n"
+        f"✂️ Split: <b>{split_label(pf.split_kb)}</b>\n\n"
+        f"Pick a format / split size, then tap <b>▶️ Start</b>. "
+        f"Starts automatically in {Config.OPTIONS_TIMEOUT}s."
+    )
+
+
+def settings_text(row: sqlite3.Row) -> str:
+    return (
+        "⚙️ <b>Output settings</b> (defaults for every file)\n\n"
+        f"📤 Format: <b>{out_format_label(row['out_format'] or '')}</b>\n"
+        f"✂️ Split: <b>{split_label(int(row['split_kb'] or 0))}</b>\n"
+        f"💬 Ask for every file: <b>{'ON' if row['ask_options'] else 'OFF'}</b>\n\n"
+        "• <b>Format</b> — get the translation back as EPUB, PDF, DOCX, TXT or HTML regardless of what you send.\n"
+        "• <b>Split</b> — big results are cut into several files no larger than the chosen size "
+        "(EPUB by chapters, PDF by pages, DOCX/HTML/TXT by paragraphs).\n"
+        "• <b>Ask</b> — OFF = files start immediately with these defaults."
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  BOT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2058,7 +2240,10 @@ async def cmd_help(client: Client, message: Message) -> None:
         "📖 <b>How it works</b>\n"
         "1. Choose your language with <b>🌐 Language</b>\n"
         "2. Send a file: <b>.epub · .pdf · .docx · .txt · .md · .html</b>\n"
-        "3. Watch live progress, get the translated file back in the same format\n\n"
+        "3. Choose the <b>output format</b> (EPUB · PDF · DOCX · TXT · HTML) and an optional <b>split size</b>\n"
+        "4. Watch live progress and receive the file(s)\n\n"
+        "⚙️ <b>Output</b> — /settings: default format, split size (e.g. ≤ 20 MB per part), "
+        "and whether to ask before every file\n\n"
         "✨ <b>What's preserved</b>\n"
         "• EPUB/HTML: chapters, bold/italic, links, images, TOC, CSS\n"
         "• DOCX: styles, tables, images, headers/footers, footnotes\n"
@@ -2070,7 +2255,7 @@ async def cmd_help(client: Client, message: Message) -> None:
         f"⭐ Premium ₹{Config.PREMIUM_PRICE_INR}: unlimited, priority queue, up to {Config.PREMIUM_MAX_FILE_MB} MB\n"
         "→ all plans: /plans\n\n"
         "<b>Commands</b>\n"
-        "/start · /help · /lang · /status · /plans · /cancel\n\n"
+        "/start · /help · /lang · /settings · /status · /plans · /cancel\n\n"
         f"💬 Support: {html.escape(Config.SUPPORT_CONTACT)}",
         disable_web_page_preview=True,
     )
@@ -2229,6 +2414,12 @@ async def cmd_cancel(client: Client, message: Message) -> None:
     if not message.from_user:
         return
     uid = message.from_user.id
+    pf = pending_files.get(uid)
+    if pf:
+        _discard_pending(pf)
+        shutil.rmtree(pf.path.parent, ignore_errors=True)
+        await safe_edit(pf.status, "🚫 <b>Cancelled.</b>")
+        return await message.reply_text("🚫 File discarded.")
     jid = jobs.by_user.get(uid)
     if jid and jobs.cancel(jid):
         await message.reply_text("🚫 Your translation has been cancelled.")
@@ -2298,8 +2489,7 @@ async def on_document(client: Client, message: Message) -> None:
         return await message.reply_text(
             f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{access.max_mb} MB</b>." + hint
         )
-    premium = access.priority == 0  # unlimited tier / admin → skips the queue
-    if jobs.user_has_job(uid) or uid in downloading:
+    if jobs.user_has_job(uid) or uid in downloading or uid in pending_files:
         return await message.reply_text("⚠️ You already have a file in progress. Use /cancel to stop it first.")
     if not pool.available() and not Config.DIRECT_FALLBACK and Config.DIRECT_CONCURRENCY <= 0:
         return await message.reply_text("⚠️ Translation service is offline right now. Please try again later.")
@@ -2325,56 +2515,232 @@ async def on_document(client: Client, message: Message) -> None:
             await safe_edit(status, f"❌ Download failed or this is not a valid {SUPPORTED_FORMATS[ext][1]} file.")
             return
 
-        # Re-resolve after the (slow) download: quota may have changed meanwhile.
-        access = resolve_access(uid)
-        if access.source == "blocked":
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            await safe_edit(status, access.reason)
-            return
-        # Credits are spent up-front (atomically) so two parallel uploads can't
-        # both ride on the same last credit; refunded if the job fails/cancels.
-        paid_with_credit = False
-        if access.source == "credit":
-            if not db.spend_credit(uid):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                await safe_edit(status, resolve_access(uid).reason or "⏳ No credits left.")
-                return
-            paid_with_credit = True
-
-        job_id = db.add_job(uid, name, row["lang"])
-        job = Job(
-            priority=access.priority,
-            created=time.time(),
-            id=job_id,
-            user_id=uid,
-            chat_id=message.chat.id,
-            file_path=Path(path),
-            file_name=name,
-            lang=row["lang"],
-            status_msg=status,
-            ext=ext,
-            credit=paid_with_credit,
+        pf = PendingFile(
+            uid=uid, chat_id=message.chat.id, path=Path(path), name=name, ext=ext, lang=row["lang"], status=status,
+            out_ext=row["out_format"] or "", split_kb=int(row["split_kb"] or 0),
         )
-        await jobs.submit(job)
+        if not (row["ask_options"] if row["ask_options"] is not None else 1):
+            await start_job(pf)                     # defaults, no questions asked
+            return
+        pending_files[uid] = pf
+        pf.timer = asyncio.create_task(_options_timeout(uid))
+        await safe_edit(status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
     except Exception as e:  # noqa: BLE001
         # never leave the user's slot reserved forever if anything above blew up
         # (previously an unexpected error here meant "You already have a file in
         # progress" until the bot was restarted)
         log.exception("on_document failed for %s: %s", uid, e)
+        pending_files.pop(uid, None)
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         await safe_edit(status, "❌ Something went wrong while receiving the file. Please try again.")
         return
     finally:
         downloading.discard(uid)
+
+
+async def _options_timeout(uid: int) -> None:
+    """Auto-start with the current selection when the user does not answer."""
+    try:
+        await asyncio.sleep(Config.OPTIONS_TIMEOUT)
+    except asyncio.CancelledError:
+        return
+    pf = pending_files.get(uid)
+    if pf and not pf.awaiting_custom:
+        await start_job(pf)
+
+
+def _discard_pending(pf: PendingFile) -> None:
+    pending_files.pop(pf.uid, None)
+    if pf.timer and not pf.timer.done():
+        pf.timer.cancel()
+
+
+async def start_job(pf: PendingFile) -> None:
+    """Charge the user's entitlement and put the pending file into the queue."""
+    _discard_pending(pf)
+    uid = pf.uid
+    tmp_dir = pf.path.parent
+    if not pf.path.exists():
+        await safe_edit(pf.status, "❌ File expired. Please send it again.")
+        return
+    if jobs.user_has_job(uid):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(pf.status, "⚠️ You already have a file in progress. Use /cancel to stop it first.")
+        return
+    # Re-resolve now: quota may have changed while the file was downloading / waiting.
+    access = resolve_access(uid)
+    if access.source == "blocked":
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(pf.status, access.reason)
+        return
+    if pf.path.stat().st_size > access.max_mb * 1024 * 1024:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await safe_edit(pf.status, f"⚠️ File too large for your plan (limit <b>{access.max_mb} MB</b>).")
+        return
+    # Credits are spent up-front (atomically) so two parallel uploads can't
+    # both ride on the same last credit; refunded if the job fails/cancels.
+    paid_with_credit = False
+    if access.source == "credit":
+        if not db.spend_credit(uid):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            await safe_edit(pf.status, resolve_access(uid).reason or "⏳ No credits left.")
+            return
+        paid_with_credit = True
+    premium = access.priority == 0
+    job_id = db.add_job(uid, pf.name, pf.lang)
+    job = Job(
+        priority=access.priority,
+        created=time.time(),
+        id=job_id,
+        user_id=uid,
+        chat_id=pf.chat_id,
+        file_path=pf.path,
+        file_name=pf.name,
+        lang=pf.lang,
+        status_msg=pf.status,
+        ext=pf.ext,
+        credit=paid_with_credit,
+        out_ext=pf.out_ext if pf.out_ext and not docconv.same_kind(pf.out_ext, pf.ext) else "",
+        split_kb=max(0, int(pf.split_kb or 0)),
+    )
+    await jobs.submit(job)
     pos = jobs.position(job_id)
+    opts = f"\n📤 {out_format_label(job.out_ext, pf.ext)} · ✂️ {split_label(job.split_kb)}"
     await safe_edit(
-        status,
-        f"✅ <b>Queued</b> · position #{pos}\n📄 {html.escape(name)}\n🌐 → {lang_name(row['lang'])}"
+        pf.status,
+        f"✅ <b>Queued</b> · position #{pos}\n📄 {html.escape(pf.name)}\n🌐 → {lang_name(pf.lang)}" + opts
         + (f"\n🎟 1 credit used · {db.credits(uid)} left" if paid_with_credit else "")
         + ("" if premium else "\n\n⭐ Premium users skip the queue — /plans"),
         cancel_kb(job_id),
     )
+
+
+@app.on_callback_query(filters.regex(r"^opt:(\w+)(?::(.+))?$"))
+async def cb_options(client: Client, cq: CallbackQuery) -> None:
+    uid = cq.from_user.id
+    pf = pending_files.get(uid)
+    action, arg = cq.matches[0].group(1), cq.matches[0].group(2) or ""
+    if not pf or (cq.message and pf.status.id != cq.message.id):
+        return await cq.answer("This file is no longer waiting — send it again.", show_alert=True)
+    if action == "fmt":
+        if arg == "same":
+            pf.out_ext = ""
+        elif arg in docconv.available_outputs():
+            pf.out_ext = arg
+        else:
+            return await cq.answer("That format is not available on this server.", show_alert=True)
+        pf.awaiting_custom = False
+        await cq.answer(f"Format: {out_format_label(pf.out_ext, pf.ext)}")
+    elif action == "split":
+        pf.split_kb = int(arg or 0)
+        pf.awaiting_custom = False
+        await cq.answer(f"Split: {split_label(pf.split_kb)}")
+    elif action == "custom":
+        pf.awaiting_custom = True
+        await cq.answer()
+        await safe_edit(
+            cq.message,
+            options_text(pf) + "\n\n✏️ <b>Send the maximum size per file</b> as a message, e.g. <code>500kb</code>, "
+            f"<code>25mb</code>, <code>1.5gb</code> (min {Config.SPLIT_MIN_KB} KB, max {Config.TG_MAX_FILE_MB} MB). Send <code>0</code> for no split.",
+            options_kb("opt", pf.out_ext, pf.split_kb, pf.ext),
+        )
+        return
+    elif action == "save":
+        db.set_out_format(uid, pf.out_ext)
+        db.set_split_kb(uid, pf.split_kb)
+        await cq.answer("Saved as your default ✔", show_alert=False)
+    elif action == "start":
+        await cq.answer("Starting…")
+        await start_job(pf)
+        return
+    elif action == "cancel":
+        _discard_pending(pf)
+        shutil.rmtree(pf.path.parent, ignore_errors=True)
+        await cq.answer("Cancelled")
+        await safe_edit(cq.message, "🚫 <b>Cancelled.</b> Send another file whenever you like.")
+        return
+    await safe_edit(cq.message, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
+
+
+async def handle_custom_size(message: Message, kb: Optional[int]) -> bool:
+    """Text sent while a file waits for a custom split size. Returns True when consumed."""
+    uid = message.from_user.id
+    pf = pending_files.get(uid)
+    if pf and pf.awaiting_custom:
+        if kb is None:
+            await message.reply_text("⚠️ Please send a size like <code>500kb</code> or <code>25mb</code> (or <code>0</code> for no split).")
+            return True
+        if kb and kb < Config.SPLIT_MIN_KB:
+            await message.reply_text(f"⚠️ Minimum split size is {Config.SPLIT_MIN_KB} KB.")
+            return True
+        if kb > Config.TG_MAX_FILE_MB * 1024:
+            await message.reply_text(f"⚠️ Telegram files can't exceed {Config.TG_MAX_FILE_MB} MB.")
+            return True
+        pf.split_kb = kb
+        pf.awaiting_custom = False
+        await safe_edit(pf.status, options_text(pf), options_kb("opt", pf.out_ext, pf.split_kb, pf.ext))
+        await message.reply_text(f"✂️ Split set: <b>{split_label(kb)}</b> — tap ▶️ Start on the panel above.")
+        return True
+    mode = pending_input.get(uid)
+    if mode == "set_custom":
+        pending_input.pop(uid, None)
+        if kb is None or (kb and kb < Config.SPLIT_MIN_KB) or kb > Config.TG_MAX_FILE_MB * 1024:
+            await message.reply_text(f"⚠️ Please send a size between {Config.SPLIT_MIN_KB} KB and {Config.TG_MAX_FILE_MB} MB, e.g. <code>25mb</code> (or <code>0</code>).")
+            return True
+        db.set_split_kb(uid, kb)
+        row = db.get_user(uid)
+        await message.reply_text(settings_text(row), reply_markup=options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
+        return True
+    return False
+
+
+# ── /settings ──────────────────────────────────────────────────────────────
+@app.on_message(filters.private & (filters.command(["settings", "output", "format", "split"]) | filters.regex(f"^{re.escape(BTN_SETTINGS)}$")))
+async def cmd_settings(client: Client, message: Message) -> None:
+    row = await guard(client, message)
+    if not row:
+        return
+    await message.reply_text(settings_text(row), reply_markup=options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
+
+
+@app.on_callback_query(filters.regex(r"^set:(\w+)(?::(.+))?$"))
+async def cb_settings(client: Client, cq: CallbackQuery) -> None:
+    uid = cq.from_user.id
+    db.upsert_user(uid, cq.from_user.first_name or "", cq.from_user.username)
+    action, arg = cq.matches[0].group(1), cq.matches[0].group(2) or ""
+    if action == "fmt":
+        if arg == "same":
+            db.set_out_format(uid, "")
+        elif arg in docconv.available_outputs():
+            db.set_out_format(uid, arg)
+        else:
+            return await cq.answer("That format is not available on this server.", show_alert=True)
+        await cq.answer("Default format saved")
+    elif action == "split":
+        db.set_split_kb(uid, int(arg or 0))
+        await cq.answer("Default split saved")
+    elif action == "custom":
+        pending_input[uid] = "set_custom"
+        await cq.answer()
+        await cq.message.reply_text(
+            f"✏️ Send the default maximum size per file, e.g. <code>500kb</code>, <code>25mb</code> "
+            f"(min {Config.SPLIT_MIN_KB} KB, max {Config.TG_MAX_FILE_MB} MB). Send <code>0</code> for no split."
+        )
+        return
+    elif action == "ask":
+        row = db.get_user(uid)
+        db.set_ask_options(uid, not bool(row["ask_options"]))
+        await cq.answer("Toggled")
+    elif action == "close":
+        await cq.answer()
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        return
+    row = db.get_user(uid)
+    await safe_edit(cq.message, settings_text(row), options_kb("set", row["out_format"] or "", int(row["split_kb"] or 0), ask=bool(row["ask_options"])))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2655,13 +3021,13 @@ async def cmd_cancel_input(client: Client, message: Message) -> None:
 
 
 # admin pending-input consumer (must be registered after commands; group=1)
-@app.on_message(admin_filter & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "admin", "cancel_input"]), group=1)
+@app.on_message(admin_filter & ~filters.command(USER_COMMANDS + ["admin", "cancel_input"]), group=1)
 async def on_admin_input(client: Client, message: Message) -> None:
     mode = pending_input.get(message.from_user.id)
-    if not mode:
+    if not mode or mode == "set_custom":
         return
     text = message.text or ""
-    if text in (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN):
+    if text in ALL_BTNS:
         return
     if text.startswith("/"):
         # any other command (/addworker, /ban, …) was already handled in group 0;
@@ -2687,11 +3053,16 @@ async def on_admin_input(client: Client, message: Message) -> None:
 
 
 # ── fallback for random text ───────────────────────────────────────────────
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel"]), group=2)
+@app.on_message(filters.private & filters.text & ~filters.command(USER_COMMANDS), group=2)
 async def on_text(client: Client, message: Message) -> None:
-    if message.text in (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN) or message.text.startswith("/"):
+    if message.text in ALL_BTNS or message.text.startswith("/"):
         return
-    if message.from_user and Config.is_admin(message.from_user.id) and message.from_user.id in pending_input:
+    if not message.from_user:
+        return
+    # a custom split size for a waiting file or for /settings?
+    if await handle_custom_size(message, parse_size_kb(message.text)):
+        return
+    if Config.is_admin(message.from_user.id) and message.from_user.id in pending_input:
         return
     await message.reply_text(
         "📎 Send me a file to translate (<b>EPUB · PDF · DOCX · TXT · HTML</b>), or use the menu below.",

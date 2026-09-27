@@ -7,3 +7,4 @@ lxml
 razorpay
 python-dotenv
 pymupdf            # PDF support (layout-preserving)
+python-docx        # DOCX *output* (docconv.py); DOCX input works with lxml alone
