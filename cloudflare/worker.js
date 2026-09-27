@@ -106,9 +106,13 @@ export default {
       } catch {
         return json({ detail: "invalid json" }, 422);
       }
+      // `null` / a bare array are valid JSON but `body.text_list` would throw → 500
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json({ detail: "invalid json" }, 422);
+      }
       const texts = Array.isArray(body.text_list) ? body.text_list.map(String) : [];
-      const lang = body.lang || "hi";
-      const source = body.source || "auto";
+      const lang = (typeof body.lang === "string" && body.lang.trim()) || "hi";
+      const source = (typeof body.source === "string" && body.source.trim()) || "auto";
       if (!texts.length) return json({ success: true, translated: [] });
       const total = texts.reduce((n, t) => n + t.length, 0);
       if (texts.length > maxItems(env) || total > maxChars(env)) {

@@ -23,6 +23,7 @@ already exports HTTP(S)_PROXY, and app.py honours them (trust_env=True).
 """
 
 import os
+import re
 import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +39,13 @@ if os.path.exists(_env_file):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.split("#", 1)[0].strip().strip('"').strip("'"))
+            v = v.strip()
+            # strip an inline comment only when it is separated by whitespace, so
+            # a secret like  WORKER_SECRET=ab#cd  is not cut in half
+            m = re.match(r"""^("[^"]*"|'[^']*'|\S*)(?:\s+#.*)?$""", v)
+            if m:
+                v = m.group(1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 from a2wsgi import ASGIMiddleware  # noqa: E402
 

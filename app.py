@@ -88,13 +88,17 @@ _PROXY = (
 _started = time.time()
 _stats = {"requests": 0, "strings": 0, "errors": 0}
 _session: Optional[aiohttp.ClientSession] = None
+_session_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     yield
     if _session and not _session.closed:
-        await _session.close()
+        try:
+            await _session.close()
+        except Exception:  # noqa: BLE001  (loop may already be gone on serverless)
+            pass
 
 
 app = FastAPI(title="EPUB Translator Worker", version="2.1", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -107,8 +111,21 @@ class TranslateIn(BaseModel):
 
 
 async def session() -> aiohttp.ClientSession:
-    global _session
-    if _session is None or _session.closed:
+    global _session, _session_loop
+    loop = asyncio.get_running_loop()
+    # Serverless hosts (Vercel) and a2wsgi (PythonAnywhere) may run successive
+    # requests on a *different* event loop while the module stays imported.  An
+    # aiohttp session is bound to the loop it was created on, so reusing it
+    # raises "attached to a different loop" / "Event loop is closed".
+    if _session is not None and (_session.closed or _session_loop is not loop):
+        if not _session.closed and _session_loop is not None and not _session_loop.is_closed():
+            try:
+                await _session.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _session = None
+    if _session is None:
+        _session_loop = loop
         connector = aiohttp.TCPConnector(limit=64, limit_per_host=0, ttl_dns_cache=300, keepalive_timeout=60)
         _session = aiohttp.ClientSession(
             headers=HEADERS,
@@ -178,16 +195,17 @@ async def _google(texts: List[str], lang: str, source: str) -> List[str]:
 async def translate(body: TranslateIn, x_worker_key: Optional[str] = Header(default=None)) -> dict:
     if WORKER_SECRET and x_worker_key != WORKER_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-    texts = body.text_list
+    texts = [str(t) for t in body.text_list]
     if not texts:
         return {"success": True, "translated": []}
     if len(texts) > MAX_ITEMS or sum(len(t) for t in texts) > MAX_CHARS:
         raise HTTPException(status_code=413, detail="batch too large")
+    lang = (body.lang or "hi").strip() or "hi"
 
     _stats["requests"] += 1
     _stats["strings"] += len(texts)
     try:
-        out = await _google(texts, body.lang, body.source)
+        out = await _google(texts, lang, body.source)
         return {"success": True, "translated": out}
     except Exception as e:  # noqa: BLE001
         _stats["errors"] += 1
