@@ -2101,7 +2101,7 @@ class StarsPayments:
             db.mark_paid(pay_id, charge_id)
             text = _activate_payment(fresh)
         _pay_locks.pop(pay_id, None)
-        await safe_send(client, uid, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 My status", callback_data="ui:status"), close_btn()]]))
+        await safe_send(client, uid, text + "\n\n📎 Send me a file to begin.", reply_markup=main_kb(uid))
         if Config.OWNER_ID:
             plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
             await safe_send(client, Config.OWNER_ID, f"⭐ New Stars payment {p['amount']} ⭐ · {plan_name} from <code>{uid}</code>")
@@ -2114,15 +2114,31 @@ stars = StarsPayments()
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── reply-keyboard (the "normal" buttons under the text box) ──────────────
+# Sticker-style labels: a bold emoji + a short word, so the menu looks like a
+# proper app bar instead of a wall of text.  Old labels are kept as aliases —
+# Telegram caches reply keyboards on the phone, so a user who has not pressed
+# /start since the update still taps the *old* text.
+BTN_PREMIUM = "👑 Premium"
 BTN_LANG = "🌐 Language"
-BTN_PREMIUM = "💼 Plans"
-BTN_PREMIUM_OLD = "⭐ Premium"   # label from older keyboards still cached on users' phones
+BTN_SETTINGS = "📂 Output"
 BTN_STATUS = "📊 Status"
-BTN_HELP = "❓ Help"
-BTN_ADMIN = "🛠 Admin"
-BTN_SETTINGS = "⚙️ Output"
-BTN_CANCEL = "🚫 Cancel"
-ALL_BTNS = (BTN_LANG, BTN_PREMIUM, BTN_PREMIUM_OLD, BTN_STATUS, BTN_HELP, BTN_ADMIN, BTN_SETTINGS, BTN_CANCEL)
+BTN_HELP = "📖 Help"
+BTN_CANCEL = "❌ Cancel"
+BTN_ADMIN = "🔱 Admin"
+
+# older cached keyboard labels → still recognised
+BTN_PREMIUM_OLD = ("⭐ Premium", "💼 Plans")
+BTN_LANG_OLD = ("🌐 Language",)
+BTN_SETTINGS_OLD = ("⚙️ Output",)
+BTN_STATUS_OLD = ("📊 Status",)
+BTN_HELP_OLD = ("❓ Help",)
+BTN_CANCEL_OLD = ("🚫 Cancel",)
+BTN_ADMIN_OLD = ("🛠 Admin",)
+
+ALL_BTNS = (
+    BTN_PREMIUM, BTN_LANG, BTN_SETTINGS, BTN_STATUS, BTN_HELP, BTN_CANCEL, BTN_ADMIN,
+    *BTN_PREMIUM_OLD, *BTN_LANG_OLD, *BTN_SETTINGS_OLD, *BTN_STATUS_OLD, *BTN_HELP_OLD, *BTN_CANCEL_OLD, *BTN_ADMIN_OLD,
+)
 USER_COMMANDS = ["start", "menu", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
 ADMIN_COMMANDS = [
     "admin", "addworker", "delworker", "addpremium", "addplan", "addcredits", "revoke",
@@ -2154,13 +2170,25 @@ def btn(*labels: str):
 
 
 def main_kb(uid: int) -> ReplyKeyboardMarkup:
+    """The persistent menu under the text box — the *only* navigation the bot
+    uses.  No inline buttons are attached to Help / Status / Start / payment
+    messages any more; everything is reachable from this bar.
+
+        ┌──────────── 👑 Premium ────────────┐
+        │ 🌐 Language       │ 📂 Output      │
+        │ 📊 Status         │ 📖 Help        │
+        │ ❌ Cancel         │ (🔱 Admin)     │
+        └───────────────────┴────────────────┘
+    """
     rows = [
+        [KeyboardButton(BTN_PREMIUM)],
         [KeyboardButton(BTN_LANG), KeyboardButton(BTN_SETTINGS)],
-        [KeyboardButton(BTN_PREMIUM), KeyboardButton(BTN_STATUS)],
-        [KeyboardButton(BTN_HELP), KeyboardButton(BTN_CANCEL)],
+        [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)],
     ]
+    last = [KeyboardButton(BTN_CANCEL)]
     if Config.is_admin(uid):
-        rows.append([KeyboardButton(BTN_ADMIN)])
+        last.append(KeyboardButton(BTN_ADMIN))
+    rows.append(last)
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -2179,36 +2207,23 @@ def close_btn(data: str = "ui:close") -> InlineKeyboardButton:
 
 
 def lang_kb(current: str) -> InlineKeyboardMarkup:
+    """Language picker — a real choice list, so it stays inline.  No Close /
+    nav buttons: the message is edited into a confirmation after a tap."""
     btns = [InlineKeyboardButton(("✅ " if c == current else "") + n, callback_data=f"lang:{c}") for c, n in LANGUAGES.items()]
-    rows = chunk(btns, 2)
-    rows.append([close_btn()])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(chunk(btns, 2))
 
 
-def cancel_kb(job_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel:{job_id}")]])
+def cancel_kb(job_id: int) -> Optional[InlineKeyboardMarkup]:
+    """Progress messages carry no inline button — the user cancels with the
+    ❌ Cancel menu button (or /cancel).  Kept as a helper so call-sites stay
+    unchanged; always returns None."""
+    return None
 
 
-def help_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🌐 Language", callback_data="ui:lang"), InlineKeyboardButton("⚙️ Output", callback_data="ui:settings")],
-            [InlineKeyboardButton("💼 Plans", callback_data="plans"), InlineKeyboardButton("📊 Status", callback_data="ui:status")],
-            [close_btn()],
-        ]
-    )
-
-
-def status_kb(uid: int) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    jid = jobs.by_user.get(uid)
-    if jid:
-        rows.append([InlineKeyboardButton("🚫 Cancel my file", callback_data=f"cancel:{jid}")])
-    elif uid in pending_files:
-        rows.append([InlineKeyboardButton("🚫 Discard waiting file", callback_data="opt:cancel")])
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="ui:status"), InlineKeyboardButton("💼 Plans", callback_data="plans")])
-    rows.append([close_btn()])
-    return InlineKeyboardMarkup(rows)
+def status_kb(uid: int) -> Optional[InlineKeyboardMarkup]:
+    """No inline buttons under /status — ❌ Cancel in the menu handles both a
+    waiting file and a queued/running job (see cancel_everything)."""
+    return None
 
 
 def support_btn() -> Optional[InlineKeyboardButton]:
@@ -2412,9 +2427,9 @@ def _free_blocked_reason() -> str:
         f"⏳ Daily free limit reached ({fmt_chars(Config.FREE_DAILY_CHARS)} characters/day).\n"
         f"🎟 Get {Config.STARTER_CREDITS} credits for just ₹{Config.STARTER_PRICE_INR} (never expire) "
         + (
-            f"or go unlimited with 🌟 Premium for {Config.STARS_PREMIUM_PRICE} ⭐ Stars / ₹{Config.PREMIUM_PRICE_INR} — /plans"
+            f"or go unlimited with 🌟 Premium for {Config.STARS_PREMIUM_PRICE} ⭐ Stars / ₹{Config.PREMIUM_PRICE_INR} — tap <b>{BTN_PREMIUM}</b> below"
             if Config.STARS_ENABLED
-            else "or go unlimited with ⭐ Premium — /plans"
+            else f"or go unlimited with ⭐ Premium — tap <b>{BTN_PREMIUM}</b> below"
         )
     )
 
@@ -2442,7 +2457,7 @@ def resolve_access(uid: int) -> Access:
     if sub:
         reason = (
             f"⏳ Daily limit of your {sub.emoji} <b>{sub.title}</b> plan reached ({sub.daily_limit} files).\n"
-            "Come back tomorrow, or buy a 🎟 credit pack / upgrade to ⭐ Premium — /plans"
+            f"Come back tomorrow, or buy a 🎟 credit pack / upgrade to ⭐ Premium — tap <b>{BTN_PREMIUM}</b> below"
         )
     else:
         reason = _free_blocked_reason()
@@ -2456,7 +2471,7 @@ def plans_kb(uid: int) -> InlineKeyboardMarkup:
 
 def plans_text(row: sqlite3.Row) -> str:
     lines = [
-        "💼 <b>Plans & Pricing</b>\n",
+        "👑 <b>Premium Plans & Pricing</b>\n",
         f"Your plan: {user_line(row)}\n",
         f"🆓 <b>Free</b> — {fmt_chars(Config.FREE_DAILY_CHARS)} characters/day · up to {Config.FREE_MAX_FILE_MB} MB\n",
     ]
@@ -2469,7 +2484,7 @@ def plans_text(row: sqlite3.Row) -> str:
         if p.tagline:
             lines.append(f"    <i>{p.tagline}</i>")
     lines.append("\n💡 Credits are used only after your daily quota is finished, so they are never wasted.")
-    lines.append("Tap a plan below to see details and pay.")
+    lines.append("👇 Tap a plan below to see details and pay.")
     return "\n".join(lines)
 
 
@@ -2573,11 +2588,11 @@ def options_kb(prefix: str, out_ext: str, split_kb: int, in_ext: str = "", ask: 
         )])
     # ── actions ──
     if prefix == "opt":
-        rows.append([InlineKeyboardButton("▶️ Start translation", callback_data="opt:start")])
-        rows.append([InlineKeyboardButton("💾 Save as default", callback_data="opt:save"), InlineKeyboardButton("🚫 Cancel", callback_data="opt:cancel")])
+        rows.append([InlineKeyboardButton("🚀 Start translation", callback_data="opt:start")])
+        rows.append([InlineKeyboardButton("💾 Save as default", callback_data="opt:save"), InlineKeyboardButton("❌ Cancel", callback_data="opt:cancel")])
     else:
         rows.append([InlineKeyboardButton(f"💬 Ask for every file: {'✅ ON' if ask else '❌ OFF'}", callback_data="set:ask")])
-        rows.append([InlineKeyboardButton("↩️ Reset defaults", callback_data="set:reset"), close_btn("set:close")])
+        rows.append([InlineKeyboardButton("↩️ Reset defaults", callback_data="set:reset")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2726,8 +2741,8 @@ def start_text(row: sqlite3.Row, first_name: str) -> str:
         "I translate <b>EPUB · PDF · DOCX · TXT · HTML</b> files into your language while keeping "
         "the original formatting, images and chapters intact.\n\n"
         f"🌐 Target language: <b>{lang_name(row['lang'])}</b>\n"
-        f"💼 Plan: {user_line(row)}\n\n"
-        "📎 <b>Send me a file to begin</b>, or use the buttons below."
+        f"👑 Plan: {user_line(row)}\n\n"
+        "📎 <b>Send me a file to begin</b>, or use the menu buttons below."
     )
 
 
@@ -2744,11 +2759,11 @@ async def cmd_start(client: Client, message: Message) -> None:
 def help_text() -> str:
     return (
         "📖 <b>How it works</b>\n"
-        "1. Choose your language with <b>🌐 Language</b>\n"
+        f"1. Choose your language with <b>{BTN_LANG}</b>\n"
         "2. Send a file: <b>.epub · .pdf · .docx · .txt · .md · .html</b>\n"
         "3. Choose the <b>output format</b> (EPUB · PDF · DOCX · TXT · HTML) and an optional <b>split size</b>\n"
         "4. Watch live progress and receive the file(s)\n\n"
-        "⚙️ <b>Output</b> — /settings: default format, split size (e.g. ≤ 20 MB per part), "
+        f"<b>{BTN_SETTINGS}</b> — /settings: default format, split size (e.g. ≤ 20 MB per part), "
         "and whether to ask before every file\n\n"
         "✨ <b>What's preserved</b>\n"
         "• EPUB/HTML: chapters, bold/italic, links, images, TOC, CSS\n"
@@ -2760,7 +2775,7 @@ def help_text() -> str:
         f"🔹 Basic ₹{Config.BASIC_PRICE_INR}: {Config.BASIC_DAILY_LIMIT} files/day for {Config.BASIC_DAYS} days, up to {Config.BASIC_MAX_FILE_MB} MB\n"
         f"⭐ Premium ₹{Config.PREMIUM_PRICE_INR}: unlimited, priority queue, up to {Config.PREMIUM_MAX_FILE_MB} MB\n"
         + (f"🌟 Premium · Stars {Config.STARS_PREMIUM_PRICE} ⭐: same as Premium, {Config.STARS_PREMIUM_DAYS} days, paid with Telegram Stars\n" if Config.STARS_ENABLED else "")
-        + "→ all plans: /plans\n\n"
+        + f"→ all plans: tap <b>{BTN_PREMIUM}</b> below or /plans\n\n"
         "🧹 <b>Novel EPUBs</b> — crawler pages (synopsis/summary, “Source”, “Generated by”, table-of-contents page) are removed automatically "
         "so audiobook/TTS readers start at chapter 1. Toggle in /settings.\n\n"
         "<b>Commands</b>\n"
@@ -2770,16 +2785,17 @@ def help_text() -> str:
 
 
 # ── /help ──────────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command("help") | btn(BTN_HELP)))
+@app.on_message(filters.private & (filters.command("help") | btn(BTN_HELP, *BTN_HELP_OLD)))
 @guarded
 async def cmd_help(client: Client, message: Message) -> None:
     if not await guard(client, message):
         return
-    await safe_reply(message, help_text(), reply_markup=help_kb())
+    # no inline buttons here — the persistent menu already has every option
+    await safe_reply(message, help_text(), reply_markup=main_kb(message.from_user.id))
 
 
 # ── language ───────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command("lang") | btn(BTN_LANG)))
+@app.on_message(filters.private & (filters.command("lang") | btn(BTN_LANG, *BTN_LANG_OLD)))
 @guarded
 async def cmd_lang(client: Client, message: Message) -> None:
     row = await guard(client, message)
@@ -2804,8 +2820,7 @@ async def cb_lang(client: Client, cq: CallbackQuery) -> None:
     await safe_answer(cq, f"Language set: {lang_name(code)}")
     await safe_edit(
         cq.message,
-        f"🌐 Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me a file (EPUB · PDF · DOCX · TXT · HTML).",
-        InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Change again", callback_data="ui:lang"), close_btn()]]),
+        f"✅ Target language: <b>{lang_name(code)}</b>\n\n📎 Now send me a file (EPUB · PDF · DOCX · TXT · HTML).",
     )
 
 
@@ -2817,19 +2832,20 @@ def status_text(row: sqlite3.Row) -> str:
     if jid:
         pos = jobs.position(jid)
         mine = "\n\n📌 <b>Your file</b>: " + ("⚙️ processing now" if jid in jobs.running else f"⏳ queue position #{pos}")
+        mine += f"\n↩️ To stop it, tap <b>{BTN_CANCEL}</b> below."
     elif uid in pending_files:
-        mine = "\n\n📌 <b>Your file</b>: waiting for you to pick output options"
+        mine = f"\n\n📌 <b>Your file</b>: waiting for you to pick output options\n↩️ To discard it, tap <b>{BTN_CANCEL}</b> below."
     return (
         "📊 <b>Status</b>\n"
         f"🌐 Language: <b>{lang_name(row['lang'])}</b>\n"
-        f"💼 Plan: {user_line(row)}\n"
+        f"👑 Plan: {user_line(row)}\n"
         f"📚 Files translated: {row['total_files']}\n\n"
         f"🖥 Workers online: {len(pool.available())}/{len(pool.workers)}\n"
         f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queued_count()}" + mine
     )
 
 
-@app.on_message(filters.private & (filters.command("status") | btn(BTN_STATUS)))
+@app.on_message(filters.private & (filters.command("status") | btn(BTN_STATUS, *BTN_STATUS_OLD)))
 @guarded
 async def cmd_status(client: Client, message: Message) -> None:
     row = await guard(client, message)
@@ -2868,15 +2884,15 @@ async def cb_ui(client: Client, cq: CallbackQuery) -> None:
     elif action == "status":
         await safe_edit(cq.message, status_text(row), status_kb(row["id"]))
     elif action == "help":
-        await safe_edit(cq.message, help_text(), help_kb())
+        await safe_edit(cq.message, help_text())
     elif action == "start":
-        await safe_edit(cq.message, start_text(row, cq.from_user.first_name or ""), help_kb())
+        await safe_edit(cq.message, start_text(row, cq.from_user.first_name or ""))
     else:
         await safe_answer(cq, "Unknown action.", alert=True)
 
 
 # ── plans / premium ────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command(["premium", "pay", "plans", "plan", "buy"]) | btn(BTN_PREMIUM, BTN_PREMIUM_OLD)))
+@app.on_message(filters.private & (filters.command(["premium", "pay", "plans", "plan", "buy"]) | btn(BTN_PREMIUM, *BTN_PREMIUM_OLD)))
 @guarded
 async def cmd_premium(client: Client, message: Message) -> None:
     row = await guard(client, message)
@@ -2901,7 +2917,9 @@ async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
         return await safe_answer(cq, "Unknown plan.", alert=True)
     uid = cq.from_user.id
     await cq_user(cq)
-    back = InlineKeyboardButton("« All plans", callback_data="plans")
+    # no « Back / ✖ Close inline buttons — the user re-opens the list with the
+    # 👑 Premium menu button; only *action* buttons (pay / verify / retry) stay inline
+    back_hint = f"\n\n↩️ Other plans: tap <b>{BTN_PREMIUM}</b> below."
 
     # unlimited users don't need a smaller sub — but credit packs/extension are always allowed
     cur = db.active_sub(uid)
@@ -2919,26 +2937,25 @@ async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
             log.error("stars invoice error: %s", e)
             return await safe_edit(
                 cq.message,
-                plan_detail_text(plan) + "\n\n⚠️ Could not create the Stars invoice. Please try again in a minute.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")], [back, close_btn()]]),
+                plan_detail_text(plan) + "\n\n⚠️ Could not create the Stars invoice. Please try again in a minute." + back_hint,
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")]]),
             )
         return await safe_edit(
             cq.message,
-            plan_detail_text(plan) + "\n\n👇 The invoice is below — tap <b>Pay</b> on it. Your plan activates automatically the moment Telegram confirms.",
-            InlineKeyboardMarkup([[back, close_btn()]]),
+            plan_detail_text(plan) + "\n\n👇 The invoice is below — tap <b>Pay</b> on it. Your plan activates automatically the moment Telegram confirms." + back_hint,
         )
 
     if not payments.enabled:
         await safe_answer(cq)
-        rows = [[back, close_btn()]]
+        rows: List[List[InlineKeyboardButton]] = []
         sb = support_btn()
         if sb:
-            rows.insert(0, [sb])
+            rows.append([sb])
         hint = f"\n\n💬 Payments are handled manually — contact {html.escape(Config.SUPPORT_CONTACT)} to buy."
         if stars.enabled:
             hint += f"\n🌟 Or pay instantly with Telegram Stars: <b>{PLANS['stars'].button}</b>"
             rows.insert(0, [InlineKeyboardButton(PLANS["stars"].button, callback_data="plan:stars")])
-        return await safe_edit(cq.message, plan_detail_text(plan) + hint, InlineKeyboardMarkup(rows))
+        return await safe_edit(cq.message, plan_detail_text(plan) + hint + back_hint, InlineKeyboardMarkup(rows) if rows else None)
     # answer first: creating a Razorpay link can take a few seconds and the
     # callback would otherwise time out (button spins forever)
     await safe_answer(cq, "Creating payment link…")
@@ -2948,17 +2965,16 @@ async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
         log.error("payment link error: %s", e)
         return await safe_edit(
             cq.message,
-            plan_detail_text(plan) + "\n\n⚠️ Payment service temporarily unavailable. Please try again in a few minutes.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")], [back, close_btn()]]),
+            plan_detail_text(plan) + "\n\n⚠️ Payment service temporarily unavailable. Please try again in a few minutes." + back_hint,
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")]]),
         )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(f"💳 Pay ₹{plan.price}", url=url)],
             [InlineKeyboardButton("✅ I've paid — verify", callback_data=f"pay:{link_id}")],
-            [back, close_btn()],
         ]
     )
-    await safe_edit(cq.message, plan_detail_text(plan), kb)
+    await safe_edit(cq.message, plan_detail_text(plan) + back_hint, kb)
 
 
 def _activate_payment(p: sqlite3.Row) -> str:
@@ -3013,7 +3029,7 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
         text = _activate_payment(p)
     _pay_locks.pop(link_id, None)
     await safe_answer(cq, "Payment verified ✅")
-    await safe_edit(cq.message, text, InlineKeyboardMarkup([[InlineKeyboardButton("📊 My status", callback_data="ui:status"), close_btn()]]))
+    await safe_edit(cq.message, text + "\n\n📎 Send me a file to begin.")
     if Config.OWNER_ID:
         plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
         await safe_send(
@@ -3063,7 +3079,7 @@ async def cancel_everything(uid: int) -> str:
     return "ℹ️ You have no active translation right now."
 
 
-@app.on_message(filters.private & (filters.command("cancel") | btn(BTN_CANCEL)))
+@app.on_message(filters.private & (filters.command("cancel") | btn(BTN_CANCEL, *BTN_CANCEL_OLD)))
 @guarded
 async def cmd_cancel(client: Client, message: Message) -> None:
     if not message.from_user:
@@ -3139,26 +3155,24 @@ async def on_document(client: Client, message: Message) -> None:
 
     access = resolve_access(uid)
     if access.source == "blocked":
-        return await safe_reply(message, access.reason, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
+        return await safe_reply(message, access.reason, reply_markup=main_kb(uid))
     file_size = doc.file_size or 0
     if file_size > access.max_mb * 1024 * 1024:
         hint = ""
-        kb = None
         if access.source != "admin" and access.max_mb < Config.PREMIUM_MAX_FILE_MB:
-            hint = f"\n⭐ Premium allows files up to {Config.PREMIUM_MAX_FILE_MB} MB."
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]])
+            hint = f"\n⭐ Premium allows files up to {Config.PREMIUM_MAX_FILE_MB} MB — tap <b>{BTN_PREMIUM}</b> below."
         return await safe_reply(
             message,
             f"⚠️ File too large ({file_size / 1048576:.1f} MB). Limit for your plan: <b>{access.max_mb} MB</b>." + hint,
-            reply_markup=kb,
+            reply_markup=main_kb(uid),
         )
     if file_size > Config.TG_MAX_FILE_MB * 1024 * 1024:
         return await safe_reply(message, f"⚠️ Telegram bots can only download files up to {Config.TG_MAX_FILE_MB} MB.")
     if jobs.user_has_job(uid) or uid in downloading or uid in pending_files:
         return await safe_reply(
             message,
-            "⚠️ You already have a file in progress. Cancel it first if you want to send another one.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Status", callback_data="ui:status")]]),
+            f"⚠️ You already have a file in progress. Tap <b>{BTN_CANCEL}</b> first if you want to send another one.",
+            reply_markup=main_kb(uid),
         )
     if not pool.available() and not Config.DIRECT_FALLBACK and Config.DIRECT_CONCURRENCY <= 0:
         return await safe_reply(message, "⚠️ Translation service is offline right now. Please try again later.")
@@ -3285,7 +3299,7 @@ async def _start_job_inner(pf: PendingFile, uid: int, tmp_dir: Path) -> None:
     access = resolve_access(uid)
     if access.source == "blocked":
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        await safe_edit(pf.status, access.reason, InlineKeyboardMarkup([[InlineKeyboardButton("💼 See plans", callback_data="plans")]]))
+        await safe_edit(pf.status, access.reason)
         return
     if pf.path.stat().st_size > access.max_mb * 1024 * 1024:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3329,7 +3343,8 @@ async def _start_job_inner(pf: PendingFile, uid: int, tmp_dir: Path) -> None:
         f"✅ <b>Queued</b> · position #{pos}\n📄 {html.escape(pf.name)}\n🌐 → {lang_name(pf.lang)}" + opts
         + (f"\n🎟 1 credit used · {db.credits(uid)} left" if paid_with_credit else "")
         + (f"\n🆓 Free quota left today: {fmt_chars(job.free_chars)} chars" if job.free_chars else "")
-        + ("" if premium else "\n\n⭐ Premium users skip the queue — /plans"),
+        + ("" if premium else f"\n\n👑 Premium users skip the queue — tap <b>{BTN_PREMIUM}</b> below")
+        + f"\n↩️ Changed your mind? Tap <b>{BTN_CANCEL}</b> below.",
         cancel_kb(job_id),
     )
 
@@ -3456,7 +3471,7 @@ async def handle_custom_size(message: Message, kb: Optional[int]) -> bool:
 
 
 # ── /settings ──────────────────────────────────────────────────────────────
-@app.on_message(filters.private & (filters.command(["settings", "output", "format", "split"]) | btn(BTN_SETTINGS)))
+@app.on_message(filters.private & (filters.command(["settings", "output", "format", "split"]) | btn(BTN_SETTINGS, *BTN_SETTINGS_OLD)))
 @guarded
 async def cmd_settings(client: Client, message: Message) -> None:
     row = await guard(client, message)
@@ -3541,7 +3556,7 @@ admin_filter = filters.private & filters.create(lambda _, __, m: bool(m.from_use
 def admin_text() -> str:
     s = db.stats()
     return (
-        "🛠 <b>Admin panel</b>\n\n"
+        "🔱 <b>Admin panel</b>\n\n"
         f"👥 Users: {s['users']} (⭐ {s['premium']} · 🚫 {s['banned']})\n"
         f"🖥 Workers: {len(pool.available())}/{len(pool.workers)} online\n"
         f"⚙️ Processing: {len(jobs.running)} · Queued: {jobs.queued_count()}\n\n"
@@ -3555,14 +3570,14 @@ def admin_text() -> str:
     )
 
 
-@app.on_message(admin_filter & (filters.command("admin") | btn(BTN_ADMIN)))
+@app.on_message(admin_filter & (filters.command("admin") | btn(BTN_ADMIN, *BTN_ADMIN_OLD)))
 @guarded
 async def cmd_admin(client: Client, message: Message) -> None:
     await safe_reply(message, admin_text(), reply_markup=admin_kb())
 
 
-# non-admins tapping a cached "🛠 Admin" button must get *some* answer
-@app.on_message(filters.private & ~admin_filter & (filters.command("admin") | btn(BTN_ADMIN)))
+# non-admins tapping a cached "🔱 Admin" / "🛠 Admin" button must get *some* answer
+@app.on_message(filters.private & ~admin_filter & (filters.command("admin") | btn(BTN_ADMIN, *BTN_ADMIN_OLD)))
 @guarded
 async def cmd_admin_denied(client: Client, message: Message) -> None:
     if not message.from_user:
@@ -4055,13 +4070,13 @@ def cleanup_on_boot() -> None:
 async def register_commands() -> None:
     """Populate the '/' command menu in Telegram (users + richer list for admins)."""
     user_cmds = [
-        BotCommand("start", "Main menu"),
-        BotCommand("lang", "Choose target language"),
-        BotCommand("settings", "Output format & split size"),
-        BotCommand("status", "Your plan, queue & workers"),
-        BotCommand("plans", "Plans & pricing"),
-        BotCommand("cancel", "Cancel current file"),
-        BotCommand("help", "How it works"),
+        BotCommand("start", "🏠 Main menu"),
+        BotCommand("lang", "🌐 Choose target language"),
+        BotCommand("settings", "📂 Output format & split size"),
+        BotCommand("status", "📊 Your plan, queue & workers"),
+        BotCommand("plans", "👑 Premium plans & pricing"),
+        BotCommand("cancel", "❌ Cancel current file"),
+        BotCommand("help", "📖 How it works"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("admin", "Admin panel"),

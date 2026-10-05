@@ -201,7 +201,7 @@ every `WORKER_PING_INTERVAL` seconds to keep sleepy free tiers awake.
 
 | User | Admin |
 |---|---|
-| Persistent keyboard: Language · Output · Plans · Status · Help · Cancel | Inline panel: Workers · Stats · Queue · Broadcast · Health check |
+| Persistent sticker-style menu: **👑 Premium** (full-width) · 🌐 Language · 📂 Output · 📊 Status · 📖 Help · ❌ Cancel — zero inline nav/close buttons (only real actions like Pay / Start stay inline) | Inline panel: Workers · Stats · Queue · Broadcast · Health check |
 | 20 languages, live progress bar + ETA, cancel button | Add / pause / remove workers (stable ids), refresh & back buttons everywhere |
 | Free tier metered in characters/day, 6 paid plans (Razorpay auto-verify + Telegram ⭐ Stars) | `/addpremium /addplan /addcredits /revoke /ban /unban /user /broadcast` |
 | Formatting preserved (bold, links, images, TOC, CSS) | SQLite persistence, rotating logs, force-sub (public **or** private channel) |
@@ -331,7 +331,7 @@ After a file is translated the user can get it back **in a different format** an
   `25mb`, `1.5gb`; minimum `SPLIT_MIN_KB`, maximum `TG_MAX_FILE_MB`).
 * **How it is asked** — after each upload a panel shows the format/split buttons and
   ▶️ *Start*; it auto-starts with the defaults after `OPTIONS_TIMEOUT` seconds.
-  `/settings` (⚙️ Output button) stores per-user defaults and can switch the panel off
+  `/settings` (📂 Output button) stores per-user defaults and can switch the panel off
   (`Ask for every file: OFF`) so files start immediately. `/cancel` also discards a file
   waiting on the panel.
 * If a conversion or split fails the original translated file is still delivered with a
