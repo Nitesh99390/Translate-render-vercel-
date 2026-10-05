@@ -1,5 +1,7 @@
 # Master bot (Oracle VM) — bot.py
-pyrogram==2.0.106
+# kurigram = maintained Pyrogram fork (same `import pyrogram`) — needed for
+# coloured buttons (ButtonStyle) and custom-emoji button icons (Bot API 9.4+)
+kurigram>=2.2.26
 tgcrypto
 aiohttp
 beautifulsoup4
