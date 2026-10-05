@@ -2807,13 +2807,17 @@ def settings_text(row: sqlite3.Row) -> str:
 #  BOT
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Pyrogram 2.0.x grabs the running loop in Client.__init__ via the deprecated
-# asyncio.get_event_loop(); on Python >= 3.12 that warns and on 3.14 it raises
-# when no loop exists yet, so create one explicitly first.
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# One explicit event loop for the whole process.  kurigram schedules every
+# internal task (dispatcher, Session.recv_worker, ping_worker, add_handler…)
+# on ``client.loop`` and resolves that lazily via asyncio.get_event_loop().
+# If the bot were later driven by ``asyncio.run()`` (which spins up a *new*
+# loop) those tasks would land on the wrong loop and die with
+# "Task was destroyed but it is pending" / "coroutine … was never awaited".
+# Creating the loop here and passing it to the Client keeps everything on
+# the same loop; ``_run_bot()`` below drives that very loop.  It also avoids
+# the deprecated implicit-loop lookup on Python >= 3.12.
+LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(LOOP)
 
 app = Client(
     Config.SESSION_NAME,
@@ -2822,6 +2826,7 @@ app = Client(
     bot_token=Config.BOT_TOKEN,
     workdir=str(Config.DATA_DIR),
     parse_mode=ParseMode.HTML,
+    loop=LOOP,
 )
 
 
@@ -4395,5 +4400,36 @@ async def main() -> None:
         log.info("Bot stopped")
 
 
+def _run_bot() -> None:
+    """Drive ``main()`` on the client's own event loop.
+
+    kurigram >= 2.2 made ``Client.run()`` keyword-only (``run(*, use_qr=…)``), so
+    the old ``app.run(main())`` raises *TypeError: Run.run() takes 1 positional
+    argument but 2 were given*.  ``asyncio.run(main())`` is not a drop-in
+    replacement either because it creates a fresh loop while the client's
+    internal tasks are bound to ``app.loop`` (see the ``LOOP`` comment above).
+    """
+    loop = app.loop
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # mirror asyncio.run()'s teardown so nothing is left pending on exit
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
 if __name__ == "__main__":
-    app.run(main())
+    _run_bot()
