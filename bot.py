@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote
 
 import aiohttp
@@ -69,6 +69,26 @@ from pyrogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+
+# ── coloured buttons + custom-emoji icons (Bot API 9.4 / kurigram >= 2.2) ──
+# `pyrogram.enums.ButtonStyle` only exists in the maintained fork (kurigram).
+# On the old pyrogram 2.0.x wheel everything degrades to plain white buttons.
+try:
+    from pyrogram.enums import ButtonStyle  # type: ignore
+
+    HAS_BUTTON_STYLE = True
+except ImportError:  # pragma: no cover - legacy pyrogram
+    class ButtonStyle:  # type: ignore[no-redef]
+        DEFAULT = PRIMARY = DANGER = SUCCESS = None
+
+    HAS_BUTTON_STYLE = False
+
+try:
+    from pyrogram.types import LinkPreviewOptions  # type: ignore
+
+    _NO_PREVIEW_KW: Dict[str, Any] = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+except ImportError:  # pragma: no cover - legacy pyrogram
+    _NO_PREVIEW_KW = {"disable_web_page_preview": True}
 
 try:
     from dotenv import load_dotenv
@@ -420,6 +440,10 @@ class Database:
                     seconds REAL DEFAULT 0,
                     created INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
                 """
             )
             # ── migrations for DBs created before multi-plan support ──
@@ -465,6 +489,20 @@ class Database:
             return self._con.execute(sql, params).fetchall()
 
     # ── users ──────────────────────────────────────────────────────────────
+    # ── key/value settings (bot-wide, admin-editable at runtime) ──────────
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self._one("SELECT value FROM settings WHERE key=?", (key,))
+        return row["value"] if row and row["value"] is not None else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def del_setting(self, key: str) -> None:
+        self._exec("DELETE FROM settings WHERE key=?", (key,))
+
+    def all_settings(self, prefix: str) -> Dict[str, str]:
+        return {r["key"]: r["value"] for r in self._all("SELECT key,value FROM settings WHERE key LIKE ?", (prefix + "%",))}
+
     def upsert_user(self, uid: int, name: str, username: Optional[str]) -> sqlite3.Row:
         row = self._one("SELECT * FROM users WHERE id=?", (uid,))
         if row is None:
@@ -2142,7 +2180,7 @@ ALL_BTNS = (
 USER_COMMANDS = ["start", "menu", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
 ADMIN_COMMANDS = [
     "admin", "addworker", "delworker", "addpremium", "addplan", "addcredits", "revoke",
-    "ban", "unban", "user", "broadcast", "cancel_input",
+    "ban", "unban", "user", "broadcast", "cancel_input", "seticon", "icons",
 ]
 KNOWN_COMMANDS = USER_COMMANDS + ADMIN_COMMANDS
 
@@ -2169,25 +2207,110 @@ def btn(*labels: str):
     return filters.create(lambda _, __, m: bool(getattr(m, "text", None)) and norm_btn(m.text) in wanted, name="btn")
 
 
-def main_kb(uid: int) -> ReplyKeyboardMarkup:
+# ── button colours & custom-emoji icons ───────────────────────────────────
+# Each menu button has a *key*; the colour is fixed here, the optional custom
+# emoji icon (the animated/sticker emoji you see in Premium sticker packs) is
+# stored in the DB by the admin with /seticon so it can be changed without a
+# redeploy.  Telegram renders the icon *before* the button text.
+#
+#   colour:  "primary" = blue · "success" = green · "danger" = red · "" = white
+#
+BTN_KEYS: Dict[str, str] = {        # key → current label
+    "premium": BTN_PREMIUM,
+    "lang": BTN_LANG,
+    "output": BTN_SETTINGS,
+    "status": BTN_STATUS,
+    "help": BTN_HELP,
+    "cancel": BTN_CANCEL,
+    "admin": BTN_ADMIN,
+    # inline action buttons
+    "start": "🚀 Start translation",
+    "save": "💾 Save as default",
+    "pay": "💳 Pay",
+    "verify": "✅ I've paid — verify",
+    "retry": "🔄 Retry",
+    "join": "📢 Join channel",
+    "joined": "✅ I've joined",
+    "support": "💬 Contact support",
+}
+BTN_COLOR: Dict[str, str] = {
+    "premium": "primary",
+    "lang": "success",
+    "output": "primary",
+    "status": "success",
+    "help": "primary",
+    "cancel": "danger",
+    "admin": "danger",
+    "start": "success",
+    "save": "primary",
+    "pay": "primary",
+    "verify": "success",
+    "retry": "primary",
+    "join": "primary",
+    "joined": "success",
+    "support": "",
+}
+_STYLE_OF = {"primary": ButtonStyle.PRIMARY, "success": ButtonStyle.SUCCESS, "danger": ButtonStyle.DANGER}
+ICON_SETTING_PREFIX = "icon:"
+
+# Custom-emoji icons only work when the bot owner has Telegram Premium (or the
+# bot bought a Fragment username).  When Telegram rejects them we flip this
+# flag and resend plain coloured buttons instead of failing the whole message.
+_icons_ok = True
+
+
+def icon_ids() -> Dict[str, str]:
+    return {k[len(ICON_SETTING_PREFIX):]: v for k, v in db.all_settings(ICON_SETTING_PREFIX).items() if v}
+
+
+def _style_kw(key: str, with_icon: bool = True) -> Dict[str, Any]:
+    """kwargs for KeyboardButton / InlineKeyboardButton: colour + optional icon."""
+    if not HAS_BUTTON_STYLE:
+        return {}
+    kw: Dict[str, Any] = {}
+    color = BTN_COLOR.get(key, "")
+    if color:
+        kw["style"] = _STYLE_OF[color]
+    if with_icon and _icons_ok:
+        icon = db.get_setting(ICON_SETTING_PREFIX + key)
+        if icon:
+            kw["icon_custom_emoji_id"] = icon
+    return kw
+
+
+def kbtn(key: str, text: Optional[str] = None, with_icon: bool = True) -> KeyboardButton:
+    return KeyboardButton(text or BTN_KEYS[key], **_style_kw(key, with_icon))
+
+
+def ibtn(key: str, text: Optional[str] = None, with_icon: bool = True, **kw) -> InlineKeyboardButton:
+    """Coloured inline button. `kw` = callback_data= / url= …"""
+    return InlineKeyboardButton(text or BTN_KEYS[key], **_style_kw(key, with_icon), **kw)
+
+
+def _is_icon_error(e: Exception) -> bool:
+    msg = str(e).upper()
+    return any(x in msg for x in ("PREMIUM_ACCOUNT_REQUIRED", "BUTTON_ICON", "ICON_INVALID", "CUSTOM_EMOJI", "DOCUMENT_INVALID", "BUTTON_STYLE"))
+
+
+def main_kb(uid: int, with_icon: bool = True) -> ReplyKeyboardMarkup:
     """The persistent menu under the text box — the *only* navigation the bot
     uses.  No inline buttons are attached to Help / Status / Start / payment
     messages any more; everything is reachable from this bar.
 
-        ┌──────────── 👑 Premium ────────────┐
-        │ 🌐 Language       │ 📂 Output      │
-        │ 📊 Status         │ 📖 Help        │
-        │ ❌ Cancel         │ (🔱 Admin)     │
-        └───────────────────┴────────────────┘
+        ┌──────────── 👑 Premium  (blue) ────────────┐
+        │ 🌐 Language  (green)  │ 📂 Output  (blue)  │
+        │ 📊 Status    (green)  │ 📖 Help    (blue)  │
+        │ ❌ Cancel    (red)    │ (🔱 Admin  (red))  │
+        └───────────────────────┴────────────────────┘
     """
     rows = [
-        [KeyboardButton(BTN_PREMIUM)],
-        [KeyboardButton(BTN_LANG), KeyboardButton(BTN_SETTINGS)],
-        [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)],
+        [kbtn("premium", with_icon=with_icon)],
+        [kbtn("lang", with_icon=with_icon), kbtn("output", with_icon=with_icon)],
+        [kbtn("status", with_icon=with_icon), kbtn("help", with_icon=with_icon)],
     ]
-    last = [KeyboardButton(BTN_CANCEL)]
+    last = [kbtn("cancel", with_icon=with_icon)]
     if Config.is_admin(uid):
-        last.append(KeyboardButton(BTN_ADMIN))
+        last.append(kbtn("admin", with_icon=with_icon))
     rows.append(last)
     return ReplyKeyboardMarkup(
         rows,
@@ -2229,9 +2352,9 @@ def status_kb(uid: int) -> Optional[InlineKeyboardMarkup]:
 def support_btn() -> Optional[InlineKeyboardButton]:
     c = Config.SUPPORT_CONTACT.strip()
     if c.startswith("@") and re.fullmatch(r"@\w{5,32}", c):
-        return InlineKeyboardButton("💬 Contact support", url=f"https://t.me/{c[1:]}")
+        return ibtn("support", url=f"https://t.me/{c[1:]}")
     if c.startswith("https://") or c.startswith("http://"):
-        return InlineKeyboardButton("💬 Contact support", url=c)
+        return ibtn("support", url=c)
     return None
 
 
@@ -2265,7 +2388,7 @@ def workers_kb() -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(f"{'⏸ Pause' if w.enabled else '▶ Enable'} #{i}", callback_data=f"wrk:toggle:{wid}"),
-                InlineKeyboardButton(f"🗑 Remove #{i}", callback_data=f"wrk:del:{wid}"),
+                ibtn("cancel", f"🗑 Remove #{i}", with_icon=False, callback_data=f"wrk:del:{wid}"),
             ]
         )
     rows.append([InlineKeyboardButton("➕ Add worker", callback_data="wrk:add"), InlineKeyboardButton("🔄 Refresh", callback_data="adm:workers")])
@@ -2282,19 +2405,48 @@ def fmt_dt(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%d %b %Y") if ts else "—"
 
 
+def _strip_icons(markup):
+    """Return a copy of a keyboard without custom-emoji icons (colours kept)."""
+    if markup is None or not HAS_BUTTON_STYLE:
+        return markup
+    rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None)
+    if not rows:
+        return markup
+    changed = False
+    for row in rows:
+        for b in row:
+            if getattr(b, "icon_custom_emoji_id", None):
+                b.icon_custom_emoji_id = None
+                changed = True
+    return markup if changed else None
+
+
+def _icons_rejected(e: Exception) -> bool:
+    """Telegram refused the custom-emoji icons → remember it and tell the admin once."""
+    global _icons_ok
+    if not _icons_ok or not _is_icon_error(e):
+        return False
+    _icons_ok = False
+    log.warning("custom-emoji button icons rejected by Telegram (%s) — falling back to plain coloured buttons. "
+                "Icons need Telegram Premium on the bot owner's account.", e)
+    return True
+
+
 async def safe_edit(msg: Optional[Message], text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
     """Edit a message; never raises (message deleted, flood-wait, network…)."""
     if msg is None:
         return
-    for _ in range(2):
+    for _ in range(3):
         try:
-            await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            await msg.edit_text(text, reply_markup=kb, **_NO_PREVIEW_KW)
             return
         except MessageNotModified:
             return
         except FloodWait as e:
             await asyncio.sleep(min(e.value, 30))
         except Exception as e:  # noqa: BLE001
+            if _icons_rejected(e) and _strip_icons(kb) is not None:
+                continue  # retry once without icons
             log.debug("edit failed: %s", e)
             return
 
@@ -2320,31 +2472,35 @@ async def safe_delete(msg: Optional[Message]) -> bool:
 
 async def safe_reply(message: Message, text: str, **kw) -> Optional[Message]:
     """reply_text that survives flood-waits and users who blocked the bot."""
-    kw.setdefault("disable_web_page_preview", True)
-    for _ in range(2):
+    for k, v in _NO_PREVIEW_KW.items():
+        kw.setdefault(k, v)
+    for _ in range(3):
         try:
             return await message.reply_text(text, **kw)
         except FloodWait as e:
             await asyncio.sleep(min(e.value, 30))
         except Exception as e:  # noqa: BLE001
+            if _icons_rejected(e) and _strip_icons(kw.get("reply_markup")) is not None:
+                continue  # retry once without icons
             log.debug("reply failed: %s", e)
             return None
     return None
 
 
 async def safe_send(client: Client, chat_id: int, text: str, **kw) -> Optional[Message]:
-    kw.setdefault("disable_web_page_preview", True)
-    try:
-        return await client.send_message(chat_id, text, **kw)
-    except FloodWait as e:
-        await asyncio.sleep(min(e.value, 30))
+    for k, v in _NO_PREVIEW_KW.items():
+        kw.setdefault(k, v)
+    for _ in range(3):
         try:
             return await client.send_message(chat_id, text, **kw)
-        except Exception:  # noqa: BLE001
+        except FloodWait as e:
+            await asyncio.sleep(min(e.value, 30))
+        except Exception as e:  # noqa: BLE001
+            if _icons_rejected(e) and _strip_icons(kw.get("reply_markup")) is not None:
+                continue  # retry once without icons
+            log.debug("send failed to %s: %s", chat_id, e)
             return None
-    except Exception as e:  # noqa: BLE001
-        log.debug("send failed to %s: %s", chat_id, e)
-        return None
+    return None
 
 
 ERR_TEXT = "⚠️ Something went wrong on our side. Please try again in a moment."
@@ -2465,7 +2621,7 @@ def resolve_access(uid: int) -> Access:
 
 
 def plans_kb(uid: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(p.button, callback_data=f"plan:{p.key}")] for p in PLANS.values()]
+    rows = [[ibtn("premium", p.button, with_icon=False, callback_data=f"plan:{p.key}")] for p in PLANS.values()]
     return InlineKeyboardMarkup(rows)
 
 
@@ -2588,8 +2744,8 @@ def options_kb(prefix: str, out_ext: str, split_kb: int, in_ext: str = "", ask: 
         )])
     # ── actions ──
     if prefix == "opt":
-        rows.append([InlineKeyboardButton("🚀 Start translation", callback_data="opt:start")])
-        rows.append([InlineKeyboardButton("💾 Save as default", callback_data="opt:save"), InlineKeyboardButton("❌ Cancel", callback_data="opt:cancel")])
+        rows.append([ibtn("start", callback_data="opt:start")])
+        rows.append([ibtn("save", callback_data="opt:save"), ibtn("cancel", callback_data="opt:cancel")])
     else:
         rows.append([InlineKeyboardButton(f"💬 Ask for every file: {'✅ ON' if ask else '❌ OFF'}", callback_data="set:ask")])
         rows.append([InlineKeyboardButton("↩️ Reset defaults", callback_data="set:reset")])
@@ -2723,8 +2879,8 @@ async def guard(client: Client, message: Message) -> Optional[sqlite3.Row]:
         return None
     if not await check_force_sub(client, u.id):
         link = await force_sub_link(client)
-        rows = [[InlineKeyboardButton("📢 Join channel", url=link)]] if link else []
-        rows.append([InlineKeyboardButton("✅ I've joined", callback_data="ui:recheck")])
+        rows = [[ibtn("join", url=link)]] if link else []
+        rows.append([ibtn("joined", callback_data="ui:recheck")])
         await safe_reply(message, "📢 Please join our channel first, then tap <b>I've joined</b>.", reply_markup=InlineKeyboardMarkup(rows))
         return None
     return row
@@ -2938,7 +3094,7 @@ async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
             return await safe_edit(
                 cq.message,
                 plan_detail_text(plan) + "\n\n⚠️ Could not create the Stars invoice. Please try again in a minute." + back_hint,
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")]]),
+                InlineKeyboardMarkup([[ibtn("retry", callback_data=f"plan:{plan.key}")]]),
             )
         return await safe_edit(
             cq.message,
@@ -2966,12 +3122,12 @@ async def cb_plan_detail(client: Client, cq: CallbackQuery) -> None:
         return await safe_edit(
             cq.message,
             plan_detail_text(plan) + "\n\n⚠️ Payment service temporarily unavailable. Please try again in a few minutes." + back_hint,
-            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"plan:{plan.key}")]]),
+            InlineKeyboardMarkup([[ibtn("retry", callback_data=f"plan:{plan.key}")]]),
         )
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"💳 Pay ₹{plan.price}", url=url)],
-            [InlineKeyboardButton("✅ I've paid — verify", callback_data=f"pay:{link_id}")],
+            [ibtn("pay", f"💳 Pay ₹{plan.price}", url=url)],
+            [ibtn("verify", callback_data=f"pay:{link_id}")],
         ]
     )
     await safe_edit(cq.message, plan_detail_text(plan) + back_hint, kb)
@@ -3454,7 +3610,7 @@ async def handle_custom_size(message: Message, kb: Optional[int]) -> bool:
         await safe_reply(
             message,
             f"✂️ Split set: <b>{split_label(pf.split_kb)}</b>",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start translation", callback_data="opt:start")]]),
+            reply_markup=InlineKeyboardMarkup([[ibtn("start", callback_data="opt:start")]]),
         )
         return True
     if pending_input.get(uid) == "set_custom":
@@ -3566,7 +3722,8 @@ def admin_text() -> str:
         "<code>/addcredits USER_ID N</code> · <code>/revoke USER_ID</code>\n"
         f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}\n"
         "<code>/ban USER_ID</code> · <code>/unban USER_ID</code> · <code>/user USER_ID</code>\n"
-        "<code>/broadcast TEXT</code> (or reply to a message)"
+        "<code>/broadcast TEXT</code> (or reply to a message)\n"
+        "<code>/seticon KEY</code> + custom emoji → sticker-style button icons · <code>/icons</code>"
     )
 
 
@@ -3644,7 +3801,7 @@ async def cb_admin(client: Client, cq: CallbackQuery) -> None:
             state = "⚙️" if j.id in jobs.running else "⏳"
             lines.append(f"{state} #{j.id} · <code>{j.user_id}</code> · {html.escape(j.file_name[:30])} → {j.lang}")
         for j in ordered[:6]:
-            rows.append([InlineKeyboardButton(f"🚫 Cancel #{j.id}", callback_data=f"cancel:{j.id}")])
+            rows.append([ibtn("cancel", f"🚫 Cancel #{j.id}", with_icon=False, callback_data=f"cancel:{j.id}")])
         if len(ordered) > 40:
             lines.append(f"… and {len(ordered) - 40} more")
         rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="adm:queue")])
@@ -3940,6 +4097,90 @@ async def cmd_cancel_input(client: Client, message: Message) -> None:
     await safe_reply(message, "Input cancelled." if had else "Nothing to cancel.")
 
 
+# ── button icons (custom emoji) ────────────────────────────────────────────
+def _custom_emoji_ids(message: Message) -> List[str]:
+    """All custom-emoji ids found in a message (text entities or a custom-emoji sticker)."""
+    ids: List[str] = []
+    for ent in (message.entities or []) + (message.caption_entities or []):
+        cid = getattr(ent, "custom_emoji_id", None)
+        if cid:
+            ids.append(str(cid))
+    st = getattr(message, "sticker", None)
+    if st is not None and getattr(st, "custom_emoji_id", None):
+        ids.append(str(st.custom_emoji_id))
+    return ids
+
+
+def icons_text() -> str:
+    cur = icon_ids()
+    lines = [
+        "🎨 <b>Button icons</b> (custom emoji shown before the button text)\n",
+        "Status: " + ("✅ active" if _icons_ok else "⚠️ rejected by Telegram — the bot owner needs <b>Telegram Premium</b> for custom-emoji icons; colours still work") + "\n",
+    ]
+    for key, label in BTN_KEYS.items():
+        lines.append(f"<code>{key}</code> → {html.escape(label)}" + (f" · icon <code>{cur[key]}</code>" if key in cur else " · <i>none</i>"))
+    lines.append(
+        "\n<b>How to set</b>\n"
+        "1. Open any Premium emoji pack (e.g. the 👑 / 🔥 ones from your sticker panel)\n"
+        "2. Send <code>/seticon premium</code> and in the <b>same message</b> add the emoji — e.g. <code>/seticon premium 👑</code> picked from the custom pack\n"
+        "   (or reply to a message that contains the custom emoji)\n"
+        "3. <code>/seticon premium off</code> removes it · <code>/icons reset</code> removes all\n"
+        "Then tap /start to refresh the keyboard."
+    )
+    if not HAS_BUTTON_STYLE:
+        lines.append("\n⚠️ Running on legacy pyrogram — install <code>kurigram</code> (see requirements-bot.txt) for colours & icons.")
+    return "\n".join(lines)
+
+
+@app.on_message(admin_filter & filters.command("icons"))
+@guarded
+async def cmd_icons(client: Client, message: Message) -> None:
+    global _icons_ok
+    arg = (message.command[1] if len(message.command) > 1 else "").lower()
+    if arg == "reset":
+        for k in icon_ids():
+            db.del_setting(ICON_SETTING_PREFIX + k)
+        _icons_ok = True
+        return await safe_reply(message, "♻️ All button icons removed.", reply_markup=main_kb(message.from_user.id))
+    if arg == "retry":
+        _icons_ok = True
+    await safe_reply(message, icons_text(), reply_markup=main_kb(message.from_user.id))
+
+
+@app.on_message(admin_filter & filters.command("seticon"))
+@guarded
+async def cmd_seticon(client: Client, message: Message) -> None:
+    global _icons_ok
+    key = (message.command[1] if len(message.command) > 1 else "").lower()
+    if key not in BTN_KEYS:
+        return await safe_reply(
+            message,
+            "Usage: <code>/seticon KEY 👑</code> — KEY is one of: " + " · ".join(f"<code>{k}</code>" for k in BTN_KEYS)
+            + "\nThe emoji must be a <b>custom (Premium) emoji</b>, picked from an emoji pack — a normal emoji has no id.",
+        )
+    rest = [x.lower() for x in message.command[2:]]
+    if rest and rest[0] in ("off", "none", "remove", "clear"):
+        db.del_setting(ICON_SETTING_PREFIX + key)
+        return await safe_reply(message, f"🗑 Icon removed for <code>{key}</code>.", reply_markup=main_kb(message.from_user.id))
+    ids = _custom_emoji_ids(message)
+    if not ids and message.reply_to_message:
+        ids = _custom_emoji_ids(message.reply_to_message)
+    if not ids:
+        return await safe_reply(
+            message,
+            "⚠️ No <b>custom emoji</b> found in that message.\n"
+            "Open the emoji panel → pick one from a <b>custom/Premium pack</b> (the sticker-style ones) and send it together with the command, "
+            "or reply to a message containing it.",
+        )
+    db.set_setting(ICON_SETTING_PREFIX + key, ids[0])
+    _icons_ok = True  # new id → give Telegram another chance
+    await safe_reply(
+        message,
+        f"✅ Icon set for <code>{key}</code> → id <code>{ids[0]}</code>\nIf the keyboard below still shows no icon, Telegram rejected it (owner needs Telegram Premium).",
+        reply_markup=main_kb(message.from_user.id),
+    )
+
+
 # admin pending-input consumer (must be registered after commands; group=1)
 @app.on_message(admin_filter & ~filters.command(KNOWN_COMMANDS), group=1)
 @guarded
@@ -4088,6 +4329,8 @@ async def register_commands() -> None:
         BotCommand("ban", "Ban USER_ID"),
         BotCommand("unban", "Unban USER_ID"),
         BotCommand("broadcast", "Broadcast a message"),
+        BotCommand("seticon", "Button icon: KEY + custom emoji"),
+        BotCommand("icons", "Show / reset button icons"),
     ]
     try:
         await app.set_bot_commands(user_cmds)

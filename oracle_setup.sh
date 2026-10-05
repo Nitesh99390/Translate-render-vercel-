@@ -19,6 +19,9 @@ echo "▶ Creating virtualenv + installing bot requirements…"
 cd "$APP_DIR"
 python3 -m venv venv
 ./venv/bin/pip install --upgrade pip wheel
+# pyrogram and kurigram both install as the `pyrogram` package — remove the old
+# one first on upgrades so the coloured-button fork is the one that gets imported
+./venv/bin/pip uninstall -y pyrogram pyrofork >/dev/null 2>&1 || true
 ./venv/bin/pip install -r requirements-bot.txt
 
 if [ ! -f .env ]; then
