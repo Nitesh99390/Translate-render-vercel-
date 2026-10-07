@@ -16,6 +16,8 @@ Highlights
   least-loaded routing, keep-alive pings, direct Google fallback
 * Razorpay payment links with automatic verification ("I've paid" button)
 * Free-tier daily limits, premium expiry, ban system, broadcast, force-sub
+* Full-screen Telegram message effects: ❤️ on /start, 🎉 when the translated
+  file lands, 🔥 on payments — plus a live spinner progress bar
 
 Environment variables (see .env.example)
 """
@@ -28,7 +30,6 @@ import hashlib
 import html
 import logging
 import os
-import posixpath
 import re
 import secrets
 import shutil
@@ -42,8 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import unquote
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import warnings
@@ -57,7 +57,7 @@ try:  # bs4 >= 4.11 warns when XHTML is parsed with an HTML parser — intended 
 except Exception:  # pragma: no cover
     pass
 from pyrogram import Client, ContinuePropagation, StopPropagation, filters, idle, raw
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.enums import ChatAction, ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
 from pyrogram.types import (
     BotCommand,
@@ -224,6 +224,12 @@ class Config:
     TG_MAX_FILE_MB = _env_int("TG_MAX_FILE_MB", 2000)
     # Seconds the "choose output" panel waits before starting with the defaults.
     OPTIONS_TIMEOUT = _env_int("OPTIONS_TIMEOUT", 90)
+
+    # ── live full-screen effects ──────────────────────────────────────────
+    # Telegram "Message Effects" (Bot API 7.4+): the emoji explodes across the
+    # whole chat screen when the message arrives — 🔥 confetti 🎉 hearts ❤️ …
+    # Only private chats support them; set EFFECTS_ENABLED=0 to turn them off.
+    EFFECTS_ENABLED = _env_bool("EFFECTS_ENABLED", True)
 
     @classmethod
     def validate(cls) -> None:
@@ -548,13 +554,6 @@ class Database:
             return None
         return PLANS.get(row["plan"] or "premium") or PLANS["premium"]
 
-    def is_premium(self, uid: int) -> bool:
-        """True for admins and users on an *unlimited* subscription."""
-        if Config.is_admin(uid):
-            return True
-        p = self.active_sub(uid)
-        return bool(p and p.daily_limit == 0)
-
     def add_subscription(self, uid: int, plan_key: str, days: int) -> int:
         """Grant/extend a subscription.
 
@@ -580,10 +579,6 @@ class Database:
             final_key = new_plan.key
         self._exec("UPDATE users SET premium_until=?, plan=? WHERE id=?", (until, final_key, uid))
         return until
-
-    # kept for old call-sites / admin command
-    def add_premium(self, uid: int, days: int) -> int:
-        return self.add_subscription(uid, "premium", days)
 
     def revoke_premium(self, uid: int) -> None:
         self._exec("UPDATE users SET premium_until=0, plan='' WHERE id=?", (uid,))
@@ -729,7 +724,6 @@ class Worker:
     fails: int = 0
     ok: int = 0
     latency: float = 0.0  # moving average, seconds
-    last_seen: float = 0.0
     disabled_until: float = 0.0
     capacity: int = 0     # 0 → Config.WORKER_CONCURRENCY
 
@@ -754,7 +748,6 @@ class Worker:
             self.ok += 1
             self.fails = 0
             self.healthy = True
-            self.last_seen = time.time()
             self.latency = latency if self.latency == 0 else self.latency * 0.7 + latency * 0.3
         else:
             self.fails += 1
@@ -817,17 +810,6 @@ class WorkerPool:
     def available(self) -> List[Worker]:
         return [w for w in self.workers.values() if w.available]
 
-    def pick(self, exclude: Optional[set] = None, need_slot: bool = True) -> Optional[Worker]:
-        avail = [w for w in self.available() if not exclude or w.url not in exclude]
-        if need_slot:
-            avail = [w for w in avail if w.has_slot]
-        if not avail:
-            return None
-        return min(avail, key=Worker.score)
-
-    def total_capacity(self) -> int:
-        return sum(w.max_inflight for w in self.available())
-
     async def _ping(self, session: aiohttp.ClientSession, w: Worker) -> None:
         t0 = time.monotonic()
         try:
@@ -841,7 +823,6 @@ class WorkerPool:
         if ok:
             w.healthy = True
             w.fails = 0
-            w.last_seen = time.time()
             w.latency = lat if w.latency == 0 else w.latency * 0.7 + lat * 0.3
         else:
             # a failed ping means "down right now"; retry on the next request
@@ -1874,17 +1855,19 @@ class JobQueue:
         assert self.session is not None
         t0 = time.monotonic()
         last_edit = 0.0
+        tick = 0
         translator = Translator(self.session, job.lang)
         fmt_label = SUPPORTED_FORMATS[job.ext][1]
         epub = await make_doc_translator(job.ext, translator, self.session, job.lang)
         out_path = job.file_path.with_name(f"{Path(job.file_name).stem} [{job.lang}]{job.ext}")
 
         async def progress(done: int, total: int) -> None:
-            nonlocal last_edit
+            nonlocal last_edit, tick
             now = time.monotonic()
             if now - last_edit < 3 and done != total:
                 return
             last_edit = now
+            tick += 1
             pct = int(done * 100 / max(total, 1))
             eta = speed = ""
             elapsed_now = now - t0
@@ -1895,7 +1878,7 @@ class JobQueue:
             endpoints = len(pool.available()) + (1 if Config.DIRECT_CONCURRENCY > 0 else 0)
             await safe_edit(
                 job.status_msg,
-                f"⚙️ <b>Translating…</b> {progress_bar(pct)} {pct}%\n"
+                f"⚙️ <b>Translating…</b>\n{live_bar(pct, tick)}\n"
                 f"📄 {html.escape(job.file_name)}\n"
                 f"🌐 → {lang_name(job.lang)} · {epub.segments:,} segments · {endpoints} endpoint(s){speed}{eta}",
                 cancel_kb(job.id),
@@ -1964,33 +1947,26 @@ class JobQueue:
 
         # ── upload ──
         n = len(parts)
-        await safe_edit(job.status_msg, f"📤 <b>Uploading {n} file{'s' if n > 1 else ''}…</b>")
+        await safe_edit(job.status_msg, f"📤 <b>Uploading {n} file{'s' if n > 1 else ''}…</b>\n{live_bar(100, 0)}")
         fmt_out = docconv.label_of(final_path.suffix)
+        kcps = int(epub.chars / max(elapsed, 1) / 1000)
         base_caption = (
-            f"✅ <b>Translation complete</b>\n"
+            f"🎉 <b>Translation complete!</b>\n"
             f"📄 {html.escape(job.file_name)}" + (f" → <b>{fmt_out}</b>" if out_ext else "") + "\n"
             f"🌐 {lang_name(job.lang)} · {epub.segments:,} segments · {epub.chars:,} chars\n"
-            f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s · {int(epub.chars / max(elapsed, 1) / 1000)}k chars/s"
+            f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s · ⚡ {kcps}k chars/s"
         )
         if notes:
             base_caption += "\nℹ️ " + "; ".join(html.escape(x) for x in notes)
+        # the full-screen burst fires on the *last* part so it lands with the final file
+        effect = done_effect(epub.chars, elapsed)
         for i, part in enumerate(parts, 1):
             caption = base_caption if n == 1 else f"📦 <b>Part {i} of {n}</b> · {docconv.fmt_size(part.stat().st_size)}\n" + base_caption
             if len(caption) > 1024:
                 caption = caption[:1000] + "…"
-            for attempt in range(3):
-                try:
-                    await app.send_document(job.chat_id, str(part), caption=caption, file_name=part.name)
-                    break
-                except FloodWait as e:
-                    await asyncio.sleep(min(e.value, 120))
-                except Exception as e:  # noqa: BLE001
-                    if attempt == 2:
-                        raise
-                    log.warning("job %d: upload part %d failed (%s), retrying", job.id, i, e)
-                    await asyncio.sleep(3)
+            await safe_send_document(app, job.chat_id, part, caption, effect=effect if i == n else None)
             if n > 1:
-                await safe_edit(job.status_msg, f"📤 <b>Uploading…</b> {i}/{n}")
+                await safe_edit(job.status_msg, f"📤 <b>Uploading…</b>\n{live_bar(i * 100 // n, i)} {i}/{n}")
         try:
             await job.status_msg.delete()
         except Exception:
@@ -2139,7 +2115,7 @@ class StarsPayments:
             db.mark_paid(pay_id, charge_id)
             text = _activate_payment(fresh)
         _pay_locks.pop(pay_id, None)
-        await safe_send(client, uid, text + "\n\n📎 Send me a file to begin.", reply_markup=main_kb(uid))
+        await safe_send(client, uid, text + "\n\n📎 Send me a file to begin.", effect=EFFECT_PAID, reply_markup=main_kb(uid))
         if Config.OWNER_ID:
             plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
             await safe_send(client, Config.OWNER_ID, f"⭐ New Stars payment {p['amount']} ⭐ · {plan_name} from <code>{uid}</code>")
@@ -2180,7 +2156,7 @@ ALL_BTNS = (
 USER_COMMANDS = ["start", "menu", "help", "lang", "status", "premium", "pay", "plans", "plan", "buy", "cancel", "settings", "output", "format", "split"]
 ADMIN_COMMANDS = [
     "admin", "addworker", "delworker", "addpremium", "addplan", "addcredits", "revoke",
-    "ban", "unban", "user", "broadcast", "cancel_input", "seticon", "icons",
+    "ban", "unban", "user", "broadcast", "cancel_input", "seticon", "icons", "effects",
 ]
 KNOWN_COMMANDS = USER_COMMANDS + ADMIN_COMMANDS
 
@@ -2396,9 +2372,82 @@ def workers_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ── live full-screen effects (Telegram "Message Effects") ──────────────────
+# When a message carries an ``effect_id`` the emoji bursts across the user's
+# whole screen (the same animation Telegram shows for 🎉 / 🔥 / ❤️ messages).
+# The ids below are Telegram's official built-in effects — they are global and
+# stable, so no DB lookup is needed.  Works in private chats only; Telegram
+# silently drops the request elsewhere, so we also retry without it on error.
+EFFECTS: Dict[str, int] = {
+    "fire": 5104841245755180586,      # 🔥 flames racing up the screen
+    "party": 5046509860389126442,     # 🎉 confetti explosion
+    "heart": 5159385139981059251,     # ❤️ floating hearts
+    "like": 5107584321108051014,      # 👍 thumbs-up shower
+    "dislike": 5104858069142078462,   # 👎
+    "poop": 5046589136895476101,      # 💩
+}
+# which moment → which effect
+EFFECT_WELCOME = "heart"      # /start
+EFFECT_DONE = "party"         # translated file delivered
+EFFECT_FAST = "fire"          # translated file delivered FAST (big file, high throughput)
+EFFECT_PAID = "fire"          # plan purchased / granted
+_effects_ok = Config.EFFECTS_ENABLED
+
+
+def effect_kw(name: Optional[str]) -> Dict[str, Any]:
+    """kwargs that make the message *shine*: ``{"effect_id": …}`` or ``{}``."""
+    if not name or not _effects_ok:
+        return {}
+    eid = EFFECTS.get(name)
+    return {"effect_id": eid} if eid else {}
+
+
+def _is_effect_error(e: Exception) -> bool:
+    msg = str(e).upper()
+    return "EFFECT" in msg or "unexpected keyword argument 'effect_id'".upper() in msg
+
+
+def _effects_rejected(e: Exception, kw: Dict[str, Any]) -> bool:
+    """Telegram (or an old pyrogram) refused the effect → drop it and retry once.
+    A per-message rejection (e.g. the chat does not support effects) is not fatal;
+    a TypeError means the library itself is too old, so switch effects off."""
+    global _effects_ok
+    if "effect_id" not in kw or not _is_effect_error(e):
+        return False
+    kw.pop("effect_id", None)
+    if isinstance(e, TypeError):
+        _effects_ok = False
+        log.warning("message effects not supported by this pyrogram build — install kurigram>=2.2 (see requirements-bot.txt)")
+    else:
+        log.debug("message effect rejected: %s", e)
+    return True
+
+
+def done_effect(chars: int, elapsed: float) -> str:
+    """🎉 for a normal job, 🔥 when a big book was translated blazing fast."""
+    kcps = chars / max(elapsed, 1) / 1000
+    return EFFECT_FAST if (chars >= 200_000 and kcps >= 8) else EFFECT_DONE
+
+
+# ── live progress bar ───────────────────────────────────────────────────────
+# A rotating spinner + a gradient of block glyphs, so the status message looks
+# alive on every edit instead of a static row of boxes.
+_SPINNER = "◐◓◑◒"
+_STAGE_EMOJI = ("🌑", "🌒", "🌓", "🌔", "🌕")
+
+
 def progress_bar(pct: int, width: int = 12) -> str:
+    pct = max(0, min(100, pct))
     filled = int(width * pct / 100)
     return "▰" * filled + "▱" * (width - filled)
+
+
+def live_bar(pct: int, tick: int, width: int = 12) -> str:
+    """``◐ ▰▰▰▰▱▱▱▱ 42 % 🌓`` — spinner frame advances on every edit."""
+    pct = max(0, min(100, pct))
+    spin = _SPINNER[tick % len(_SPINNER)] if pct < 100 else "✅"
+    moon = _STAGE_EMOJI[min(len(_STAGE_EMOJI) - 1, pct * len(_STAGE_EMOJI) // 101)]
+    return f"{spin} {progress_bar(pct, width)} <b>{pct}%</b> {moon}"
 
 
 def fmt_dt(ts: int) -> str:
@@ -2470,16 +2519,20 @@ async def safe_delete(msg: Optional[Message]) -> bool:
         return False
 
 
-async def safe_reply(message: Message, text: str, **kw) -> Optional[Message]:
-    """reply_text that survives flood-waits and users who blocked the bot."""
+async def safe_reply(message: Message, text: str, effect: Optional[str] = None, **kw) -> Optional[Message]:
+    """reply_text that survives flood-waits and users who blocked the bot.
+    ``effect="party"`` makes the message burst across the screen (see EFFECTS)."""
     for k, v in _NO_PREVIEW_KW.items():
         kw.setdefault(k, v)
-    for _ in range(3):
+    kw.update(effect_kw(effect))
+    for _ in range(4):
         try:
             return await message.reply_text(text, **kw)
         except FloodWait as e:
             await asyncio.sleep(min(e.value, 30))
         except Exception as e:  # noqa: BLE001
+            if _effects_rejected(e, kw):
+                continue  # retry once without the effect
             if _icons_rejected(e) and _strip_icons(kw.get("reply_markup")) is not None:
                 continue  # retry once without icons
             log.debug("reply failed: %s", e)
@@ -2487,20 +2540,51 @@ async def safe_reply(message: Message, text: str, **kw) -> Optional[Message]:
     return None
 
 
-async def safe_send(client: Client, chat_id: int, text: str, **kw) -> Optional[Message]:
+async def safe_send(client: Client, chat_id: int, text: str, effect: Optional[str] = None, **kw) -> Optional[Message]:
+    """send_message with the same resilience (and ``effect=``) as safe_reply."""
     for k, v in _NO_PREVIEW_KW.items():
         kw.setdefault(k, v)
-    for _ in range(3):
+    kw.update(effect_kw(effect))
+    for _ in range(4):
         try:
             return await client.send_message(chat_id, text, **kw)
         except FloodWait as e:
             await asyncio.sleep(min(e.value, 30))
         except Exception as e:  # noqa: BLE001
+            if _effects_rejected(e, kw):
+                continue  # retry once without the effect
             if _icons_rejected(e) and _strip_icons(kw.get("reply_markup")) is not None:
                 continue  # retry once without icons
             log.debug("send failed to %s: %s", chat_id, e)
             return None
     return None
+
+
+async def safe_send_document(client: Client, chat_id: int, path: Path, caption: str, effect: Optional[str] = None, **kw) -> Message:
+    """Upload a file with an optional full-screen effect on arrival.
+    Retries on flood-wait / transient errors; raises after the last attempt so
+    the job is marked failed (and the credit refunded) instead of silently lost."""
+    kw.update(effect_kw(effect))
+    kw.setdefault("file_name", path.name)
+    last: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            await client.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        except Exception:  # noqa: BLE001 — purely cosmetic
+            pass
+        try:
+            return await client.send_document(chat_id, str(path), caption=caption, **kw)
+        except FloodWait as e:
+            await asyncio.sleep(min(e.value, 120))
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if _effects_rejected(e, kw):
+                continue  # retry once without the effect
+            if attempt == 3:
+                raise
+            log.warning("upload to %s failed (%s), retrying", chat_id, e)
+            await asyncio.sleep(3)
+    raise last or TranslationError("upload failed")
 
 
 ERR_TEXT = "⚠️ Something went wrong on our side. Please try again in a moment."
@@ -2914,7 +2998,12 @@ async def cmd_start(client: Client, message: Message) -> None:
     row = await guard(client, message)
     if not row:
         return
-    await safe_reply(message, start_text(row, message.from_user.first_name), reply_markup=main_kb(message.from_user.id))
+    await safe_reply(
+        message,
+        start_text(row, message.from_user.first_name),
+        effect=EFFECT_WELCOME,
+        reply_markup=main_kb(message.from_user.id),
+    )
 
 
 def help_text() -> str:
@@ -3190,7 +3279,9 @@ async def cb_pay(client: Client, cq: CallbackQuery) -> None:
         text = _activate_payment(p)
     _pay_locks.pop(link_id, None)
     await safe_answer(cq, "Payment verified ✅")
-    await safe_edit(cq.message, text + "\n\n📎 Send me a file to begin.")
+    # a fresh message (not an edit) so the 🔥 full-screen effect can play
+    await safe_delete(cq.message)
+    await safe_send(client, cq.from_user.id, text + "\n\n📎 Send me a file to begin.", effect=EFFECT_PAID, reply_markup=main_kb(cq.from_user.id))
     if Config.OWNER_ID:
         plan_name = (PLANS.get(p["plan"]) or PLANS["premium"]).title
         await safe_send(
@@ -3728,7 +3819,8 @@ def admin_text() -> str:
         f"Plans: {' · '.join(f'<code>{k}</code>' for k in PLANS)}\n"
         "<code>/ban USER_ID</code> · <code>/unban USER_ID</code> · <code>/user USER_ID</code>\n"
         "<code>/broadcast TEXT</code> (or reply to a message)\n"
-        "<code>/seticon KEY</code> + custom emoji → sticker-style button icons · <code>/icons</code>"
+        "<code>/seticon KEY</code> + custom emoji → sticker-style button icons · <code>/icons</code>\n"
+        "<code>/effects</code> → preview the full-screen 🔥🎉❤️ message effects"
     )
 
 
@@ -3909,9 +4001,9 @@ async def cmd_addpremium(client: Client, message: Message) -> None:
     days = _arg_int(message, 2, Config.PREMIUM_DAYS)
     if uid is None or days is None or days <= 0:
         return await safe_reply(message, "Usage: <code>/addpremium USER_ID [days]</code>")
-    until = db.add_premium(uid, days)
+    until = db.add_subscription(uid, "premium", days)
     await safe_reply(message, f"⭐ Premium for <code>{uid}</code> till {fmt_dt(until)}.")
-    await safe_send(client, uid, f"🎉 <b>Premium activated!</b> Valid till <b>{fmt_dt(until)}</b>.")
+    await safe_send(client, uid, f"🎉 <b>Premium activated!</b> Valid till <b>{fmt_dt(until)}</b>.", effect=EFFECT_PAID)
 
 
 @app.on_message(admin_filter & filters.command("addplan"))
@@ -3936,7 +4028,7 @@ async def cmd_addplan(client: Client, message: Message) -> None:
         total = db.add_credits(uid, n)
         await safe_reply(message, f"{plan.emoji} +{n} credits for <code>{uid}</code> → {total} total.")
         note = f"🎉 <b>{plan.emoji} {plan.title} activated!</b> +{n} credits → you now have <b>{total}</b>. They never expire."
-    await safe_send(client, uid, note)
+    await safe_send(client, uid, note, effect=EFFECT_PAID)
 
 
 @app.on_message(admin_filter & filters.command("addcredits"))
@@ -3949,7 +4041,7 @@ async def cmd_addcredits(client: Client, message: Message) -> None:
     total = db.add_credits(uid, n)
     await safe_reply(message, f"🎟 Credits for <code>{uid}</code>: {n:+d} → <b>{total}</b>.")
     if n > 0:
-        await safe_send(client, uid, f"🎟 You received <b>{n}</b> file credits → total <b>{total}</b>. They never expire.")
+        await safe_send(client, uid, f"🎟 You received <b>{n}</b> file credits → total <b>{total}</b>. They never expire.", effect=EFFECT_PAID)
 
 
 @app.on_message(admin_filter & filters.command("revoke"))
@@ -4186,6 +4278,38 @@ async def cmd_seticon(client: Client, message: Message) -> None:
     )
 
 
+# ── full-screen effects preview ────────────────────────────────────────────
+_EFFECT_LABEL = {"fire": "🔥 Fire", "party": "🎉 Confetti", "heart": "❤️ Hearts", "like": "👍 Thumbs up", "poop": "💩 Poop", "dislike": "👎 Thumbs down"}
+
+
+@app.on_message(admin_filter & filters.command("effects"))
+@guarded
+async def cmd_effects(client: Client, message: Message) -> None:
+    """/effects [name] — fire one effect, or show the whole catalogue."""
+    global _effects_ok
+    name = (message.command[1] if len(message.command) > 1 else "").lower()
+    if name in ("on", "off"):
+        _effects_ok = name == "on" and Config.EFFECTS_ENABLED
+        return await safe_reply(message, f"✨ Message effects {'enabled' if _effects_ok else 'disabled'} until restart.")
+    if name in EFFECTS:
+        return await safe_reply(message, f"{_EFFECT_LABEL.get(name, name)} — <code>{EFFECTS[name]}</code>", effect=name)
+    usage = {
+        "/start": EFFECT_WELCOME, "file delivered": EFFECT_DONE, "big file, fast": EFFECT_FAST,
+        "payment / plan granted": EFFECT_PAID,
+    }
+    lines = [
+        "✨ <b>Full-screen message effects</b>",
+        "Status: " + ("✅ active" if _effects_ok else "⏸ off — <code>/effects on</code>" if Config.EFFECTS_ENABLED else "⏸ disabled via EFFECTS_ENABLED=0"),
+        "",
+        "<b>Where they fire</b>",
+        *(f"• {k} → {_EFFECT_LABEL.get(v, v)}" for k, v in usage.items()),
+        "",
+        "<b>Preview</b>: <code>/effects NAME</code> · NAME = " + " · ".join(f"<code>{k}</code>" for k in EFFECTS),
+        "<code>/effects off</code> / <code>/effects on</code> toggles them at runtime.",
+    ]
+    await safe_reply(message, "\n".join(lines), effect=EFFECT_DONE)
+
+
 # admin pending-input consumer (must be registered after commands; group=1)
 @app.on_message(admin_filter & ~filters.command(KNOWN_COMMANDS), group=1)
 @guarded
@@ -4336,6 +4460,7 @@ async def register_commands() -> None:
         BotCommand("broadcast", "Broadcast a message"),
         BotCommand("seticon", "Button icon: KEY + custom emoji"),
         BotCommand("icons", "Show / reset button icons"),
+        BotCommand("effects", "Preview full-screen message effects"),
     ]
     try:
         await app.set_bot_commands(user_cmds)
